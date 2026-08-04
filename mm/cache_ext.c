@@ -8,10 +8,12 @@
 
 static const struct btf_type* cache_ext_eviction_ctx_type;
 static const struct btf_type* cache_ext_admission_ctx_type;
+static const struct btf_type* cache_ext_list_node_type;
+static const struct btf_type* mem_cgroup_type;
 
 static int bpf_cache_ext_init(struct btf* btf)
 {
-  u32 eviction_type_id, admission_type_id;
+  u32 eviction_type_id, admission_type_id, list_node_type_id, mem_cgroup_type_id;
 
   eviction_type_id = btf_find_by_name_kind(btf, "cache_ext_eviction_ctx",
                                            BTF_KIND_STRUCT);
@@ -29,8 +31,26 @@ static int bpf_cache_ext_init(struct btf* btf)
     return -EINVAL;
   }
 
+  list_node_type_id = btf_find_by_name_kind(btf, "cache_ext_list_node",
+                                            BTF_KIND_STRUCT);
+  if (list_node_type_id < 0)
+  {
+    pr_err("cache_ext: failed to find struct cache_ext_list_node\n");
+    return -EINVAL;
+  }
+
+  mem_cgroup_type_id = btf_find_by_name_kind(btf, "mem_cgroup",
+                                              BTF_KIND_STRUCT);
+  if (mem_cgroup_type_id < 0)
+  {
+    pr_err("cache_ext: failed to find struct mem_cgroup\n");
+    return -EINVAL;
+  }
+
   cache_ext_eviction_ctx_type = btf_type_by_id(btf, eviction_type_id);
   cache_ext_admission_ctx_type = btf_type_by_id(btf, admission_type_id);
+  cache_ext_list_node_type = btf_type_by_id(btf, list_node_type_id);
+  mem_cgroup_type = btf_type_by_id(btf, mem_cgroup_type_id);
   return 0;
 }
 
@@ -85,6 +105,28 @@ static int bpf_cache_ext_btf_struct_access(struct bpf_verifier_log* log,
   else if (t == cache_ext_admission_ctx_type)
   {
     if (off + size > sizeof(struct cache_ext_admission_ctx))
+    {
+      bpf_log(log,
+              "out of bounds access at off %d with size %d\n",
+              off, size);
+      return -EACCES;
+    }
+    return SCALAR_VALUE;
+  }
+  else if (t == cache_ext_list_node_type)
+  {
+    if (off + size > sizeof(struct cache_ext_list_node))
+    {
+      bpf_log(log,
+              "out of bounds access at off %d with size %d\n",
+              off, size);
+      return -EACCES;
+    }
+    return SCALAR_VALUE;
+  }
+  else if (t == mem_cgroup_type)
+  {
+    if (off + size > sizeof(struct mem_cgroup))
     {
       bpf_log(log,
               "out of bounds access at off %d with size %d\n",
