@@ -219,11 +219,14 @@ static void filemap_unaccount_folio(struct address_space *mapping,
 void __filemap_remove_folio(struct folio *folio, void *shadow)
 {
 	struct address_space *mapping = folio->mapping;
-	/* cache_ext: folio_evicted hook */
+	/* cache_ext: folios_evicted hook (batch of 1) */
 	struct mem_cgroup *memcg = folio_memcg(folio);
 	struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
-	if (pcext_ops != NULL && pcext_ops->folio_evicted != NULL)
-		pcext_ops->folio_evicted(folio);
+	if (pcext_ops != NULL && pcext_ops->folios_evicted != NULL) {
+		struct cache_ext_evicted_ctx ctx = { .nr_folios = 1 };
+		ctx.folios[0] = folio;
+		pcext_ops->folios_evicted(&ctx);
+	}
 
 	if (memcg && memcg->cache_ext_valid)
 		valid_folios_del(folio);
@@ -332,15 +335,40 @@ void delete_from_page_cache_batch(struct address_space *mapping,
 	if (!folio_batch_count(fbatch))
 		return;
 
+	/* cache_ext: batch folios_evicted hook — one BPF call for the whole batch */
+	{
+		struct cache_ext_evicted_ctx ctx = { .nr_folios = 0 };
+		struct cache_ext_ops *batch_ops = NULL;
+		bool ops_uniform = true;
+
+		for (i = 0; i < folio_batch_count(fbatch); i++) {
+			struct cache_ext_ops *ops = get_cache_ext_ops(folio_memcg(fbatch->folios[i]));
+			if (i == 0)
+				batch_ops = ops;
+			else if (ops != batch_ops)
+				ops_uniform = false;
+			if (ctx.nr_folios < 32)
+				ctx.folios[ctx.nr_folios++] = fbatch->folios[i];
+		}
+		if (ops_uniform && batch_ops && batch_ops->folios_evicted)
+			batch_ops->folios_evicted(&ctx);
+		else if (!ops_uniform) {
+			for (i = 0; i < folio_batch_count(fbatch); i++) {
+				struct cache_ext_ops *ops = get_cache_ext_ops(folio_memcg(fbatch->folios[i]));
+				if (ops && ops->folios_evicted) {
+					struct cache_ext_evicted_ctx single = { .nr_folios = 1 };
+					single.folios[0] = fbatch->folios[i];
+					ops->folios_evicted(&single);
+				}
+			}
+		}
+	}
+
 	spin_lock(&mapping->host->i_lock);
 	xa_lock_irq(&mapping->i_pages);
 	for (i = 0; i < folio_batch_count(fbatch); i++) {
 		struct folio *folio = fbatch->folios[i];
-		/* cache_ext: folio_evicted hook */
 		struct mem_cgroup *memcg = folio_memcg(folio);
-		struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
-		if (pcext_ops != NULL && pcext_ops->folio_evicted != NULL)
-			pcext_ops->folio_evicted(folio);
 
 		if (memcg && memcg->cache_ext_valid)
 			valid_folios_del(folio);

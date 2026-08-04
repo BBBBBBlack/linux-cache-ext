@@ -19725,7 +19725,17 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 		 * inherit env->ops and expected_attach_type for the rest of the
 		 * verification
 		 */
-		env->ops = bpf_verifier_ops[tgt_prog->type];
+		if (tgt_prog->type == BPF_PROG_TYPE_STRUCT_OPS) {
+			const struct bpf_struct_ops *st_ops;
+
+			st_ops = bpf_struct_ops_find(tgt_prog->aux->attach_btf_id);
+			if (st_ops)
+				env->ops = st_ops->verifier_ops;
+			else
+				env->ops = bpf_verifier_ops[tgt_prog->type];
+		} else {
+			env->ops = bpf_verifier_ops[tgt_prog->type];
+		}
 		prog->expected_attach_type = tgt_prog->expected_attach_type;
 	}
 

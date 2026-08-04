@@ -9,6 +9,7 @@
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/atomic.h>
 // #include <linux/bpf.h>
 
 typedef u64 (*bpf_callback_t)(u64, u64, u64, u64, u64);
@@ -46,6 +47,15 @@ struct cache_ext_list_node
   struct folio* folio;
 
   struct list_head node;
+
+  u64 metadata[2];
+
+  /*
+   * Protect nodes temporarily removed from the cache_ext list by sampling.
+   * Keep this after BPF-visible fields to avoid changing their offsets.
+   */
+  atomic_t pin_count;
+  bool removed;
 };
 
 /*
@@ -81,6 +91,8 @@ u64 bpf_cache_ext_ds_registry_new_list(struct mem_cgroup* memcg);
  */
 struct cache_ext_list_node* cache_ext_list_node_alloc(struct folio* folio);
 void cache_ext_list_node_free(struct cache_ext_list_node* node);
+bool cache_ext_list_node_try_pin(struct cache_ext_list_node* node);
+void cache_ext_list_node_unpin(struct cache_ext_list_node* node);
 
 /*
  * cache_ext data structure registry.
@@ -100,10 +112,10 @@ struct cache_ext_ds_registry
 };
 
 void cache_ext_ds_registry_init(struct cache_ext_ds_registry* registry);
-void cache_ext_ds_registry_read_lock(struct folio* folio);
-void cache_ext_ds_registry_read_unlock(struct folio* folio);
-void cache_ext_ds_registry_write_lock(struct folio* folio);
-void cache_ext_ds_registry_write_unlock(struct folio* folio);
+unsigned long cache_ext_ds_registry_read_lock(struct folio* folio);
+void cache_ext_ds_registry_read_unlock(struct folio* folio, unsigned long flags);
+unsigned long cache_ext_ds_registry_write_lock(struct folio* folio);
+void cache_ext_ds_registry_write_unlock(struct folio* folio, unsigned long flags);
 void cache_ext_ds_registry_del_all(struct mem_cgroup* memcg);
 struct cache_ext_list* cache_ext_ds_registry_new_list(struct mem_cgroup* memcg);
 struct cache_ext_list*

@@ -7,6 +7,7 @@
 #include <linux/btf.h>
 #include <linux/cache_ext.h>
 #include <linux/list.h>
+#include <linux/limits.h>
 #include <linux/memcontrol.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
@@ -51,46 +52,75 @@ struct cache_ext_list* cache_ext_list_alloc(void)
 struct cache_ext_list_node* cache_ext_list_node_alloc(struct folio* folio)
 {
   struct cache_ext_list_node* node =
-      kmalloc(sizeof(struct cache_ext_list_node), GFP_KERNEL);
+      kzalloc(sizeof(struct cache_ext_list_node), GFP_NOWAIT);
   if (!node)
   {
     return NULL;
   }
   INIT_LIST_HEAD(&node->node);
   node->folio = folio;
+  atomic_set(&node->pin_count, 0);
+  node->removed = false;
   return node;
 }
 
 void cache_ext_list_node_free(struct cache_ext_list_node* node)
 {
-  // TODO: Verify it's isolated first.
+  if (!node)
+    return;
+  if (atomic_read(&node->pin_count) > 0)
+  {
+    WRITE_ONCE(node->removed, true);
+    return;
+  }
   kfree(node);
+}
+
+bool cache_ext_list_node_try_pin(struct cache_ext_list_node* node)
+{
+  if (!node || READ_ONCE(node->removed) || !node->folio)
+    return false;
+
+  if (!folio_try_get(node->folio))
+    return false;
+
+  atomic_inc(&node->pin_count);
+  return true;
+}
+
+void cache_ext_list_node_unpin(struct cache_ext_list_node* node)
+{
+  if (!node)
+    return;
+
+  if (node->folio)
+    folio_put(node->folio);
+
+  if (atomic_dec_and_test(&node->pin_count) && READ_ONCE(node->removed))
+    kfree(node);
 }
 
 int __cache_ext_list_add_impl(struct cache_ext_list* list, struct folio* folio,
                               bool tail)
 {
+  unsigned long flags, reg_flags;
   struct valid_folios_set* valid_folios_set = folio_to_valid_folios_set(folio);
   spinlock_t* bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
-  spin_lock(bucket_lock);
+  spin_lock_irqsave(bucket_lock, flags);
   struct valid_folio* valid_folio = valid_folios_lookup(folio);
   if (!valid_folio)
   {
-    spin_unlock(bucket_lock);
+    spin_unlock_irqrestore(bucket_lock, flags);
     return -1;
   }
 
-  // TODO: Make sure the cache_ext_list still exists.
+  reg_flags = cache_ext_ds_registry_write_lock(folio);
 
-  // Get the global list lock
-  cache_ext_ds_registry_write_lock(folio);
-
-  // Is this node already in a list?
   struct cache_ext_list_node* node = valid_folio->cache_ext_node;
   if (!list_empty(&node->node))
   {
-    cache_ext_ds_registry_write_unlock(folio);
-    spin_unlock(bucket_lock);
+    cache_ext_ds_registry_write_unlock(folio, reg_flags);
+    spin_unlock_irqrestore(bucket_lock, flags);
     return -1;
   }
 
@@ -99,8 +129,8 @@ int __cache_ext_list_add_impl(struct cache_ext_list* list, struct folio* folio,
   else
     list_add(&valid_folio->cache_ext_node->node, &list->head);
 
-  cache_ext_ds_registry_write_unlock(folio);
-  spin_unlock(bucket_lock);
+  cache_ext_ds_registry_write_unlock(folio, reg_flags);
+  spin_unlock_irqrestore(bucket_lock, flags);
   return 0;
 }
 
@@ -117,74 +147,73 @@ int cache_ext_list_add_tail(struct cache_ext_list* list, struct folio* folio)
 int cache_ext_list_move(struct cache_ext_list* list, struct folio* folio,
                         bool tail)
 {
+  unsigned long flags, reg_flags;
   struct valid_folios_set* valid_folios_set = folio_to_valid_folios_set(folio);
   spinlock_t* bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
-  spin_lock(bucket_lock);
+  spin_lock_irqsave(bucket_lock, flags);
   struct valid_folio* valid_folio = valid_folios_lookup(folio);
   if (!valid_folio)
   {
-    spin_unlock(bucket_lock);
+    spin_unlock_irqrestore(bucket_lock, flags);
     return -1;
   }
 
-  // Get the global list lock
-  cache_ext_ds_registry_write_lock(folio);
+  reg_flags = cache_ext_ds_registry_write_lock(folio);
 
-  // Add the node to the new list
   if (tail)
     list_move_tail(&valid_folio->cache_ext_node->node, &list->head);
   else
     list_move(&valid_folio->cache_ext_node->node, &list->head);
 
-  cache_ext_ds_registry_write_unlock(folio);
-  spin_unlock(bucket_lock);
+  cache_ext_ds_registry_write_unlock(folio, reg_flags);
+  spin_unlock_irqrestore(bucket_lock, flags);
   return 0;
 }
 
 int cache_ext_list_del(struct folio* folio)
 {
+  unsigned long flags, reg_flags;
   struct valid_folios_set* valid_folios_set = folio_to_valid_folios_set(folio);
   spinlock_t* bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
 
-  spin_lock(bucket_lock);
+  spin_lock_irqsave(bucket_lock, flags);
 
   struct valid_folio* valid_folio = valid_folios_lookup(folio);
   if (!valid_folio)
   {
-    spin_unlock(bucket_lock);
+    spin_unlock_irqrestore(bucket_lock, flags);
     return -ENOENT;
   }
 
-  // Get the global list lock
-  cache_ext_ds_registry_write_lock(folio);
+  reg_flags = cache_ext_ds_registry_write_lock(folio);
 
-  // Check if the node is already in no list.
   if (list_empty(&valid_folio->cache_ext_node->node))
   {
-    cache_ext_ds_registry_write_unlock(folio);
-    spin_unlock(bucket_lock);
+    cache_ext_ds_registry_write_unlock(folio, reg_flags);
+    spin_unlock_irqrestore(bucket_lock, flags);
     return -1;
   }
 
   list_del_init(&valid_folio->cache_ext_node->node);
 
-  cache_ext_ds_registry_write_unlock(folio);
-  spin_unlock(bucket_lock);
+  cache_ext_ds_registry_write_unlock(folio, reg_flags);
+  spin_unlock_irqrestore(bucket_lock, flags);
   return 0;
 }
 
 struct folio* cache_ext_list_pop(struct cache_ext_list* list, bool tail)
 {
+  unsigned long flags;
   struct cache_ext_list_node* node;
   struct folio* folio = NULL;
 
   if (!list || !list->registry)
     return NULL;
 
-  write_lock(&list->registry->lock);
+  write_lock_irqsave(&list->registry->lock, flags);
   if (list_empty(&list->head))
   {
-    write_unlock(&list->registry->lock);
+    write_unlock_irqrestore(&list->registry->lock, flags);
     return NULL;
   }
 
@@ -195,7 +224,7 @@ struct folio* cache_ext_list_pop(struct cache_ext_list* list, bool tail)
 
   list_del_init(&node->node);
   folio = node->folio;
-  write_unlock(&list->registry->lock);
+  write_unlock_irqrestore(&list->registry->lock, flags);
 
   return folio;
 }
@@ -226,8 +255,9 @@ int cache_ext_list_iterate(struct mem_cgroup* memcg,
   if (ctx && ctx->nr_folios_to_evict >= ARRAY_SIZE(ctx->folios_to_evict))
     return CACHE_EXT_EVICT_ARRAY_FILLED;
 
+  unsigned long flags;
   struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_memcg(memcg);
-  read_lock(&registry->lock);
+  read_lock_irqsave(&registry->lock, flags);
 
   list_for_each_entry(node, &list->head, node)
   {
@@ -275,7 +305,7 @@ int cache_ext_list_iterate(struct mem_cgroup* memcg,
     }
   }
 
-  read_unlock(&registry->lock);
+  read_unlock_irqrestore(&registry->lock, flags);
   return ret;
 }
 
@@ -367,10 +397,11 @@ int cache_ext_list_iterate_extended(struct mem_cgroup* memcg,
     evict_list = list;
   }
 
+  unsigned long flags;
   if (opts->continue_mode == CACHE_EXT_ITERATE_SKIP && opts->evict_mode == CACHE_EXT_ITERATE_SKIP)
-    read_lock(&registry->lock);
+    read_lock_irqsave(&registry->lock, flags);
   else
-    write_lock(&registry->lock);
+    write_lock_irqsave(&registry->lock, flags);
 
   list_for_each_entry_safe(node, node2, &list->head, node)
   {
@@ -426,10 +457,10 @@ int cache_ext_list_iterate_extended(struct mem_cgroup* memcg,
     }
   }
 
-  if (opts->continue_mode == CACHE_EXT_CONTINUE_ITER && opts->evict_mode == CACHE_EXT_CONTINUE_ITER)
-    read_unlock(&registry->lock);
+  if (opts->continue_mode == CACHE_EXT_ITERATE_SKIP && opts->evict_mode == CACHE_EXT_ITERATE_SKIP)
+    read_unlock_irqrestore(&registry->lock, flags);
   else
-    write_unlock(&registry->lock);
+    write_unlock_irqrestore(&registry->lock, flags);
 
   return ret;
 }
@@ -544,16 +575,37 @@ void __putback_list_nodes(struct cache_ext_list* list, struct cache_ext_list_nod
 {
   for (int i = 0; i < size; i++)
   {
+    struct cache_ext_list_node* node = sample_folios_arr[i];
+    if (!node)
+      continue;
+
+    if (READ_ONCE(node->removed))
+      continue;
+
     // HACK: Check if either left or right pointer is poisoned
-    if (sample_folios_arr[i]->node.next == LIST_POISON1 ||
-        sample_folios_arr[i]->node.next == LIST_POISON2 ||
-        sample_folios_arr[i]->node.prev == LIST_POISON1 ||
-        sample_folios_arr[i]->node.prev == LIST_POISON2)
+    if (node->node.next == LIST_POISON1 ||
+        node->node.next == LIST_POISON2 ||
+        node->node.prev == LIST_POISON1 ||
+        node->node.prev == LIST_POISON2)
     {
       pr_warn("cache_ext: folio removed from page cache while isolated by sampling\n");
+      WRITE_ONCE(node->removed, true);
       continue;
     }
-    list_add_tail(&sample_folios_arr[i]->node, &list->head);
+
+    if (list_empty(&node->node))
+      list_add_tail(&node->node, &list->head);
+  }
+}
+
+void __unpin_sample_nodes(struct cache_ext_list_node** sample_folios_arr, int size)
+{
+  for (int i = 0; i < size; i++)
+  {
+    if (!sample_folios_arr[i])
+      continue;
+    cache_ext_list_node_unpin(sample_folios_arr[i]);
+    sample_folios_arr[i] = NULL;
   }
 }
 
@@ -574,6 +626,7 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
   int sample_folios_size = 0;
   struct cache_ext_list_node** sample_folios_arr = this_cpu_ptr(sample_folios);
 
+  unsigned long flags;
   struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_memcg(memcg);
   struct cache_ext_list* list_ptr = cache_ext_ds_registry_get(registry, list);
   if (!list_ptr)
@@ -581,22 +634,29 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
     pr_err("cache_ext: list is NULL\n");
     return -1;
   }
-  write_lock(&registry->lock);
+  write_lock_irqsave(&registry->lock, flags);
 
   // Optimization: Snip the front of the list and select the pages without
   // holding the lock.
-  for (int i = 0; i < num_folios_to_sample; i++)
+  for (int attempts = 0; sample_folios_size < num_folios_to_sample &&
+                       attempts < num_folios_to_sample * 2; attempts++)
   {
     if (list_empty(&list_ptr->head))
     {
       pr_warn("cache_ext: ran out of folios to sample\n");
       __putback_list_nodes(list_ptr, sample_folios_arr, sample_folios_size);
-      write_unlock(&registry->lock);
+      write_unlock_irqrestore(&registry->lock, flags);
+      __unpin_sample_nodes(sample_folios_arr, sample_folios_size);
       return -1;
     }
     struct cache_ext_list_node* node = list_first_entry(
         &list_ptr->head, struct cache_ext_list_node, node);
-    sample_folios_arr[i] = node;
+    if (!cache_ext_list_node_try_pin(node))
+    {
+      list_move_tail(&node->node, &list_ptr->head);
+      continue;
+    }
+    sample_folios_arr[sample_folios_size] = node;
     sample_folios_size++;
     // if (node->node.next == NULL || node->node.prev == NULL) {
     // 	pr_warn("cache_ext: node->node.next or node->node.prev is NULL\n");
@@ -604,15 +664,18 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
     list_del_init(&node->node);
   }
 
-  write_unlock(&registry->lock);
+  write_unlock_irqrestore(&registry->lock, flags);
 
   // 1. For every n elements, evict the one with the min score
   ctx->nr_folios_to_evict = 0;
   int sample_folios_idx = 0;
-  for (int i = 0; i < ctx->request_nr_folios_to_evict; i++)
+  int nr_selectable = sample_folios_size / sample_size;
+  if (nr_selectable > ctx->request_nr_folios_to_evict)
+    nr_selectable = ctx->request_nr_folios_to_evict;
+  for (int i = 0; i < nr_selectable; i++)
   {
     struct cache_ext_list_node* min_node = sample_folios_arr[sample_folios_idx];
-    s64 min_score = score_fn(min_node);
+    s64 min_score = READ_ONCE(min_node->removed) ? S64_MAX : score_fn(min_node);
 
     sample_folios_idx++;
 
@@ -624,7 +687,7 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
     for (int j = 1; j < sample_size; j++)
     {
       struct cache_ext_list_node* curr_node = sample_folios_arr[sample_folios_idx];
-      s64 curr_score = score_fn(curr_node);
+      s64 curr_score = READ_ONCE(curr_node->removed) ? S64_MAX : score_fn(curr_node);
       sample_folios_idx++;
       if (curr_score < min_score)
       {
@@ -632,16 +695,23 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
         min_node = curr_node;
       }
     }
-    // min_node must be non-NULL here
-    ctx->folios_to_evict[ctx->nr_folios_to_evict] = min_node->folio;
-    ctx->scores[ctx->nr_folios_to_evict] = min_score;
-    ctx->nr_folios_to_evict++;
+    if (!READ_ONCE(min_node->removed) && min_score != S64_MAX)
+    {
+      if (cache_ext_list_node_try_pin(min_node))
+      {
+        ctx->folios_to_evict[ctx->nr_folios_to_evict] = min_node->folio;
+        ctx->scores[ctx->nr_folios_to_evict] = min_score;
+        ctx->nodes_to_evict[ctx->nr_folios_to_evict] = min_node;
+        ctx->nr_folios_to_evict++;
+      }
+    }
   }
 
   // 2. Put everything to the back of the list.
-  write_lock(&registry->lock);
+  write_lock_irqsave(&registry->lock, flags);
   __putback_list_nodes(list_ptr, sample_folios_arr, sample_folios_size);
-  write_unlock(&registry->lock);
+  write_unlock_irqrestore(&registry->lock, flags);
+  __unpin_sample_nodes(sample_folios_arr, sample_folios_size);
 
   return 0;
 }
@@ -737,10 +807,11 @@ struct cache_ext_list* cache_ext_ds_registry_new_list(struct mem_cgroup* memcg)
   {
     return NULL;
   }
-  write_lock(&registry->lock);
+  unsigned long flags;
+  write_lock_irqsave(&registry->lock, flags);
   if (registry->nr_entries >= CACHE_EXT_REGISTRY_MAX_ENTRIES)
   {
-    write_unlock(&registry->lock);
+    write_unlock_irqrestore(&registry->lock, flags);
     cache_ext_list_free(list);
     return NULL;
   }
@@ -748,7 +819,7 @@ struct cache_ext_list* cache_ext_ds_registry_new_list(struct mem_cgroup* memcg)
   u64 key = (u64)list;
   hash_add(registry->ds_hash, &list->h_node, key);
   registry->nr_entries++;
-  write_unlock(&registry->lock);
+  write_unlock_irqrestore(&registry->lock, flags);
 
   return list;
 }
@@ -756,18 +827,19 @@ struct cache_ext_list* cache_ext_ds_registry_new_list(struct mem_cgroup* memcg)
 struct cache_ext_list*
 cache_ext_ds_registry_get(struct cache_ext_ds_registry* registry, u64 list_ptr)
 {
+  unsigned long flags;
   struct cache_ext_list* cur_list;
   u64 key = list_ptr;
-  read_lock(&registry->lock);
+  read_lock_irqsave(&registry->lock, flags);
   hash_for_each_possible(registry->ds_hash, cur_list, h_node, key)
   {
     if (key == (u64)cur_list)
     {
-      read_unlock(&registry->lock);
+      read_unlock_irqrestore(&registry->lock, flags);
       return cur_list;
     }
   }
-  read_unlock(&registry->lock);
+  read_unlock_irqrestore(&registry->lock, flags);
 
   return NULL;
 }
@@ -791,44 +863,49 @@ cache_ext_ds_registry_from_mem_cgroup(struct mem_cgroup* memcg)
   return &memcg->nodeinfo[0]->cache_ext_ds_registry;
 }
 
-void cache_ext_ds_registry_read_lock(struct folio* folio)
+unsigned long cache_ext_ds_registry_read_lock(struct folio* folio)
 {
+  unsigned long flags;
   struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_folio(folio);
-  read_lock(&registry->lock);
+  read_lock_irqsave(&registry->lock, flags);
+  return flags;
 }
 
-void cache_ext_ds_registry_read_unlock(struct folio* folio)
+void cache_ext_ds_registry_read_unlock(struct folio* folio, unsigned long flags)
 {
   struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_folio(folio);
-  read_unlock(&registry->lock);
+  read_unlock_irqrestore(&registry->lock, flags);
 }
 
-void cache_ext_ds_registry_write_lock(struct folio* folio)
+unsigned long cache_ext_ds_registry_write_lock(struct folio* folio)
 {
+  unsigned long flags;
   struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_folio(folio);
-  write_lock(&registry->lock);
+  write_lock_irqsave(&registry->lock, flags);
+  return flags;
 }
 
-void cache_ext_ds_registry_write_unlock(struct folio* folio)
+void cache_ext_ds_registry_write_unlock(struct folio* folio, unsigned long flags)
 {
   struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_folio(folio);
-  write_unlock(&registry->lock);
+  write_unlock_irqrestore(&registry->lock, flags);
 }
 
 void cache_ext_ds_registry_del_all(struct mem_cgroup* memcg)
 {
+  unsigned long flags;
   int bkt;
   struct hlist_node* tmp;
   struct cache_ext_list* cur_list;
   struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_memcg(memcg);
-  write_lock(&registry->lock);
+  write_lock_irqsave(&registry->lock, flags);
   hash_for_each_safe(registry->ds_hash, bkt, tmp, cur_list, h_node)
   {
     hash_del(&cur_list->h_node);
     cache_ext_list_free(cur_list);
   }
   registry->nr_entries = 0;
-  write_unlock(&registry->lock);
+  write_unlock_irqrestore(&registry->lock, flags);
   struct valid_folios_set* valid_folios_set = memcg_to_valid_folios_set(memcg);
   valid_folios_clear_list(valid_folios_set);
 }
@@ -901,6 +978,18 @@ __bpf_kfunc struct cache_ext_eviction_ctx* bpf_cache_ext_handle_to_ctx(u64 handl
   return (struct cache_ext_eviction_ctx*)(handle ^ secret_key);
 }
 
+__bpf_kfunc u64 bpf_cache_ext_evicted_ctx_to_handle(struct cache_ext_evicted_ctx* ctx, u64 secret_key)
+{
+  if (!ctx)
+    return 0;
+  return (u64)ctx ^ secret_key;
+}
+
+__bpf_kfunc struct cache_ext_evicted_ctx* bpf_cache_ext_handle_to_evicted_ctx(u64 handle, u64 secret_key)
+{
+  return (struct cache_ext_evicted_ctx*)(handle ^ secret_key);
+}
+
 __bpf_kfunc struct mem_cgroup* bpf_cgroup_to_memcg(struct cgroup* cgrp)
 {
 #ifdef CONFIG_MEMCG
@@ -929,6 +1018,73 @@ __bpf_kfunc struct mem_cgroup* bpf_cache_ext_folio_to_memcg(struct folio* folio)
   return folio_memcg(folio);
 }
 
+__bpf_kfunc struct cache_ext_list_node* bpf_cache_ext_folio_to_node(struct folio* folio)
+{
+  if (!folio)
+    return NULL;
+
+  struct valid_folios_set* vfs = folio_to_valid_folios_set(folio);
+  if (!vfs)
+    return NULL;
+
+  spinlock_t* bucket_lock = valid_folios_set_get_bucket_lock(vfs, folio);
+  unsigned long flags;
+  spin_lock_irqsave(bucket_lock, flags);
+
+  struct valid_folio* vf = valid_folios_lookup(folio);
+  struct cache_ext_list_node* node = vf ? vf->cache_ext_node : NULL;
+
+  spin_unlock_irqrestore(bucket_lock, flags);
+  return node;
+}
+
+static inline void metadata_copy(u64* dst, const void* src, u32 sz)
+{
+  const u64* s = src;
+  if (sz >= 16) {
+    dst[0] = s[0];
+    dst[1] = s[1];
+  } else if (sz >= 8) {
+    dst[0] = s[0];
+  }
+}
+
+__bpf_kfunc int bpf_cache_ext_folio_set_metadata(struct folio* folio,
+                                                  void* data, u32 data__sz)
+{
+  struct cache_ext_list_node* node = bpf_cache_ext_folio_to_node(folio);
+  if (!node || data__sz > sizeof(node->metadata))
+    return -EINVAL;
+  metadata_copy(node->metadata, data, data__sz);
+  return 0;
+}
+
+__bpf_kfunc u64 bpf_cache_ext_folio_add_metadata(struct folio* folio, u32 idx,
+                                                  u64 val)
+{
+  struct cache_ext_list_node* node = bpf_cache_ext_folio_to_node(folio);
+  if (!node || idx > 1)
+    return 0;
+  return __sync_fetch_and_add(&node->metadata[idx], val);
+}
+
+__bpf_kfunc int bpf_cache_ext_node_set_metadata(
+    struct cache_ext_list_node* node, void* data, u32 data__sz)
+{
+  if (!node || data__sz > sizeof(node->metadata))
+    return -EINVAL;
+  metadata_copy(node->metadata, data, data__sz);
+  return 0;
+}
+
+__bpf_kfunc u64 bpf_cache_ext_node_add_metadata(
+    struct cache_ext_list_node* node, u32 idx, u64 val)
+{
+  if (!node || idx > 1)
+    return 0;
+  return __sync_fetch_and_add(&node->metadata[idx], val);
+}
+
 BTF_SET8_START(cache_ext_handle_ops)
 BTF_ID_FLAGS(func, bpf_cache_ext_folio_to_handle)
 BTF_ID_FLAGS(func, bpf_cache_ext_memcg_to_handle)
@@ -936,8 +1092,15 @@ BTF_ID_FLAGS(func, bpf_cache_ext_ctx_to_handle)
 BTF_ID_FLAGS(func, bpf_cache_ext_handle_to_folio, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cache_ext_handle_to_memcg, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cache_ext_handle_to_ctx, KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_cache_ext_evicted_ctx_to_handle)
+BTF_ID_FLAGS(func, bpf_cache_ext_handle_to_evicted_ctx, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cgroup_to_memcg, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cache_ext_folio_to_memcg, KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_cache_ext_folio_to_node, KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_cache_ext_folio_set_metadata)
+BTF_ID_FLAGS(func, bpf_cache_ext_folio_add_metadata)
+BTF_ID_FLAGS(func, bpf_cache_ext_node_set_metadata)
+BTF_ID_FLAGS(func, bpf_cache_ext_node_add_metadata)
 BTF_SET8_END(cache_ext_handle_ops)
 
 static const struct btf_kfunc_id_set cache_ext_kfunc_set_handle_ops = {

@@ -15,6 +15,7 @@
 #include <linux/backing-dev.h>
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h> /* for buffer_heads_over_limit */
+#include <linux/cache_ext.h>
 #include <linux/compaction.h>
 #include <linux/cpu.h>
 #include <linux/cpuset.h>
@@ -6642,6 +6643,9 @@ static unsigned long __cache_ext_isolate_and_reclaim(struct lruvec* lruvec,
   LIST_HEAD(free_folios);
   unsigned long nr_reclaimed = 0, nr_reclaimed_for_batch = 0;
   struct cache_ext_eviction_ctx ctx;
+  unsigned long total_requested = 0, total_returned = 0;
+  unsigned long nr_invalid = 0, nr_isolate_fail = 0;
+  unsigned long nr_batches = 0;
   pr_debug("cache_ext: Trying to evict %lu pages\n", request_nr_to_evict);
   for (long request_nr_to_evict_batch = min((long)32, request_nr_to_evict);
        request_nr_to_evict > 0;
@@ -6651,6 +6655,9 @@ static unsigned long __cache_ext_isolate_and_reclaim(struct lruvec* lruvec,
     memset(&ctx, 0, sizeof(ctx));
     ctx.request_nr_folios_to_evict = request_nr_to_evict_batch;
     pcext_ops->evict_folios(&ctx, lruvec_memcg(lruvec));
+    nr_batches++;
+    total_requested += request_nr_to_evict_batch;
+    total_returned += ctx.nr_folios_to_evict;
     if (ctx.nr_folios_to_evict > ARRAY_SIZE(ctx.folios_to_evict))
     {
       pr_debug("cache_ext: nr_folios_evicted bigger than array size!\n");
@@ -6669,17 +6676,26 @@ static unsigned long __cache_ext_isolate_and_reclaim(struct lruvec* lruvec,
     for (int i = 0; i < ctx.nr_folios_to_evict; i++)
     {
       struct folio* untrusted_folio_ptr = ctx.folios_to_evict[i];
+      struct cache_ext_list_node* pinned_node = ctx.nodes_to_evict[i];
       if (!valid_folios_exists_unlocked(lruvec_to_valid_folios_set(lruvec), untrusted_folio_ptr))
       {
         pr_debug("cache_ext: Folio not in valid_folios_set: %p!\n", untrusted_folio_ptr);
+        nr_invalid++;
+        if (pinned_node)
+          cache_ext_list_node_unpin(pinned_node);
         continue;
       }
       // Isolate page
       if (!cache_ext_isolate_folio(untrusted_folio_ptr))
       {
         pr_debug("cache_ext: Failed to isolate folio: %p\n", untrusted_folio_ptr);
+        nr_isolate_fail++;
+        if (pinned_node)
+          cache_ext_list_node_unpin(pinned_node);
         continue;
       }
+      if (pinned_node)
+        cache_ext_list_node_unpin(pinned_node);
       // Free isolated folios
       list_add(&untrusted_folio_ptr->lru, &free_folios);
     }
@@ -6692,6 +6708,8 @@ static unsigned long __cache_ext_isolate_and_reclaim(struct lruvec* lruvec,
     nr_reclaimed += nr_reclaimed_for_batch;
   }
 
+  pr_info_ratelimited("cache_ext evict: batches=%lu req=%lu returned=%lu reclaimed=%lu invalid=%lu isolate_fail=%lu\n",
+                      nr_batches, total_requested, total_returned, nr_reclaimed, nr_invalid, nr_isolate_fail);
   pr_debug("cache_ext: Reclaimed %lu pages\n", nr_reclaimed);
   // TODO: Add some watchdog mechanism. If the hook is not performing adequetely, skip it.
 free:
@@ -6783,21 +6801,23 @@ static void shrink_lruvec(struct lruvec* lruvec, struct scan_control* sc)
   }
   else
   {
-    pr_debug("cache_ext: nr_to_evict is 0. Setting reclaim_pct to 100\n");
-    reclaim_pct = 100;
+    pr_debug("cache_ext: nr_to_evict is 0. Falling back to kernel scan\n");
+    reclaim_pct = 0;
   };
   // TODO: Check the nr_reclaimed is less than nr_to_evict
   sc->nr_reclaimed += nr_reclaimed;
   sc->nr_scanned += nr_reclaimed;
   if (reclaim_pct > threshold_pct)
   {
-    // pr_debug("Reclaimed more than %llu%% of the pages we wanted to evict. Finishing reclaim.\n", threshold_pct);
+    pr_info_ratelimited("cache_ext reclaim OK: nr_to_evict=%lu reclaimed=%lu pct=%llu => skip kernel scan\n",
+                        nr_to_evict, nr_reclaimed, reclaim_pct);
     blk_finish_plug(&plug);
     return;
   }
   else
   {
-    pr_debug("Reclaimed less than %llu%% (%llu) of the pages we wanted to evict. Reclaiming more.\n", threshold_pct, reclaim_pct);
+    pr_info_ratelimited("cache_ext reclaim SHORT: nr_to_evict=%lu reclaimed=%lu pct=%llu => kernel fallback scan\n",
+                        nr_to_evict, nr_reclaimed, reclaim_pct);
   }
   /***********************************************************************/
 

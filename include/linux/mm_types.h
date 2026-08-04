@@ -1383,6 +1383,12 @@ struct cache_ext_eviction_ctx {
 	unsigned long nr_folios_to_evict;
 	struct folio *folios_to_evict[32];
 	s64 scores[32];
+	struct cache_ext_list_node *nodes_to_evict[32];
+};
+
+struct cache_ext_evicted_ctx {
+	unsigned long nr_folios;
+	struct folio *folios[32];
 };
 
 struct cache_ext_admission_ctx {
@@ -1398,7 +1404,7 @@ struct cache_ext_ops {
 	void (*evict_folios)(struct cache_ext_eviction_ctx *ctx, struct mem_cgroup *memcg);
 	void (*folio_added)(struct folio *folio);
 	void (*folio_accessed)(struct folio *folio);
-	void (*folio_evicted)(struct folio *folio);
+	void (*folios_evicted)(struct cache_ext_evicted_ctx *ctx);
 	bool (*admit_folio)(struct cache_ext_admission_ctx *ctx);
 	// TODO: Add name?
 };
