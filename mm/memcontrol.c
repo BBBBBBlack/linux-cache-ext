@@ -357,10 +357,14 @@ void free_valid_folios_set(struct valid_folios_set *valid_folios_set) {
 }
 
 void valid_folios_add(struct folio *folio) {
-	// TODO: Error check this!
 	struct valid_folio *new = kmalloc(sizeof(struct valid_folio), GFP_KERNEL);
-	WARN_ON_ONCE(!new);
+	if (!new)
+		return;
 	struct cache_ext_list_node *node = cache_ext_list_node_alloc(folio);
+	if (!node) {
+		kfree(new);
+		return;
+	}
 	new->folio_ptr = folio_ptr_to_key(folio);
 	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
 	// Lock the bucket
@@ -396,16 +400,13 @@ void valid_folios_del(struct folio *folio) {
 	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
 		if (cur->folio_ptr == key) {
 			hash_del(&cur->h_node);
-			// TODO: If BPF has not removed it we are screwed!
-			// Change to dealloc in BPF.
 
-			cache_ext_ds_registry_write_lock(folio);
-			// Is it in a list currently? If so, remove it.
-			// if (!list_empty(&cur->cache_ext_node->node)) {
-			list_del(&cur->cache_ext_node->node);
-			//}
-			cache_ext_ds_registry_write_unlock(folio);
-			cache_ext_list_node_free(cur->cache_ext_node);
+			if (cur->cache_ext_node) {
+				cache_ext_ds_registry_write_lock(folio);
+				list_del(&cur->cache_ext_node->node);
+				cache_ext_ds_registry_write_unlock(folio);
+				cache_ext_list_node_free(cur->cache_ext_node);
+			}
 
 			kfree(cur);
 			spin_unlock(bucket_lock);

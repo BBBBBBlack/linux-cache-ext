@@ -225,7 +225,7 @@ void __filemap_remove_folio(struct folio *folio, void *shadow)
 	if (pcext_ops != NULL && pcext_ops->folio_evicted != NULL)
 		pcext_ops->folio_evicted(folio);
 
-	if (memcg->cache_ext_valid)
+	if (memcg && memcg->cache_ext_valid)
 		valid_folios_del(folio);
 	trace_mm_filemap_delete_from_page_cache(folio);
 	filemap_unaccount_folio(mapping, folio);
@@ -342,7 +342,7 @@ void delete_from_page_cache_batch(struct address_space *mapping,
 		if (pcext_ops != NULL && pcext_ops->folio_evicted != NULL)
 			pcext_ops->folio_evicted(folio);
 
-		if (memcg->cache_ext_valid)
+		if (memcg && memcg->cache_ext_valid)
 			valid_folios_del(folio);
 		trace_mm_filemap_delete_from_page_cache(folio);
 		filemap_unaccount_folio(mapping, folio);
@@ -933,7 +933,7 @@ unlock:
 
 	struct mem_cgroup *memcg = folio_memcg(folio);
 	/* cache_ext: Maintain the valid folios hashtable */
-	if (memcg->cache_ext_valid)
+	if (memcg && memcg->cache_ext_valid)
 		valid_folios_add(folio);
 	/* cache_ext: folio_added hook */
 	struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
