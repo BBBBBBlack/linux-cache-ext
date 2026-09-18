@@ -6647,10 +6647,9 @@ static unsigned long __cache_ext_isolate_and_reclaim(struct lruvec* lruvec,
   unsigned long nr_invalid = 0, nr_isolate_fail = 0;
   unsigned long nr_batches = 0;
   pr_debug("cache_ext: Trying to evict %lu pages\n", request_nr_to_evict);
-  for (long request_nr_to_evict_batch = min((long)32, request_nr_to_evict);
-       request_nr_to_evict > 0;
-       request_nr_to_evict -= 32)
+  while (request_nr_to_evict > 0)
   {
+    long request_nr_to_evict_batch = min((long)32, request_nr_to_evict);
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.request_nr_folios_to_evict = request_nr_to_evict_batch;
@@ -6706,6 +6705,7 @@ static unsigned long __cache_ext_isolate_and_reclaim(struct lruvec* lruvec,
       pr_debug("cache_ext: nr_reclaimed(%lu) != request_nr_to_evict(%lu)!\n", nr_reclaimed_for_batch, ctx.nr_folios_to_evict);
     }
     nr_reclaimed += nr_reclaimed_for_batch;
+    request_nr_to_evict -= request_nr_to_evict_batch;
   }
 
   pr_info_ratelimited("cache_ext evict: batches=%lu req=%lu returned=%lu reclaimed=%lu invalid=%lu isolate_fail=%lu\n",

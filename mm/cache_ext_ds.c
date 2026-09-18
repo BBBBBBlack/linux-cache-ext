@@ -243,6 +243,15 @@ enum cache_ext_iter_ret
   CACHE_EXT_EVICT_ARRAY_FILLED = 9,
 };
 
+static bool cache_ext_evict_ctx_full(struct cache_ext_eviction_ctx* ctx)
+{
+  if (!ctx)
+    return false;
+
+  return ctx->nr_folios_to_evict >= ctx->request_nr_folios_to_evict ||
+         ctx->nr_folios_to_evict >= ARRAY_SIZE(ctx->folios_to_evict);
+}
+
 int cache_ext_list_iterate(struct mem_cgroup* memcg,
                            struct cache_ext_list* list, void* iter_fn,
                            struct cache_ext_eviction_ctx* ctx)
@@ -252,7 +261,7 @@ int cache_ext_list_iterate(struct mem_cgroup* memcg,
   struct cache_ext_list_node* node;
   bpf_callback_t bpf_iter_fn = (bpf_callback_t)iter_fn;
 
-  if (ctx && ctx->nr_folios_to_evict >= ARRAY_SIZE(ctx->folios_to_evict))
+  if (cache_ext_evict_ctx_full(ctx))
     return CACHE_EXT_EVICT_ARRAY_FILLED;
 
   unsigned long flags;
@@ -292,7 +301,7 @@ int cache_ext_list_iterate(struct mem_cgroup* memcg,
       ctx->folios_to_evict[ctx->nr_folios_to_evict] = node->folio;
       ctx->nr_folios_to_evict++;
 
-      if (ctx->nr_folios_to_evict == ARRAY_SIZE(ctx->folios_to_evict))
+      if (cache_ext_evict_ctx_full(ctx))
       {
         ret = CACHE_EXT_EVICT_ARRAY_FILLED;
         break;
@@ -369,7 +378,7 @@ int cache_ext_list_iterate_extended(struct mem_cgroup* memcg,
   if (!cache_ext_validate_iterate_opts(opts))
     return -1;
 
-  if (ctx->nr_folios_to_evict >= ARRAY_SIZE(ctx->folios_to_evict))
+  if (cache_ext_evict_ctx_full(ctx))
     return CACHE_EXT_EVICT_ARRAY_FILLED;
 
   // TODO: pass this from caller
@@ -444,7 +453,7 @@ int cache_ext_list_iterate_extended(struct mem_cgroup* memcg,
 
       opts->nr_folios_evict++;
 
-      if (ctx->nr_folios_to_evict == ARRAY_SIZE(ctx->folios_to_evict))
+      if (cache_ext_evict_ctx_full(ctx))
       {
         ret = CACHE_EXT_EVICT_ARRAY_FILLED;
         break;
