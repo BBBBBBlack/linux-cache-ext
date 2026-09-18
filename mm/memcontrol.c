@@ -466,8 +466,7 @@ u64 valid_folios_get_nr_entries(struct valid_folios_set *valid_folios_set) {
 	return (u64) (atomic64_read(&valid_folios_set->nr_entries));
 }
 
-struct valid_folio *valid_folios_lookup(struct folio *folio) {
-	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
+struct valid_folio *valid_folios_lookup_unlocked(struct valid_folios_set *valid_folios_set, struct folio *folio) {
 	struct valid_folio *cur;
 	uintptr_t key = folio_ptr_to_key(folio);
 	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
@@ -476,6 +475,11 @@ struct valid_folio *valid_folios_lookup(struct folio *folio) {
 		}
 	}
 	return NULL;
+}
+
+struct valid_folio *valid_folios_lookup(struct folio *folio) {
+	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
+	return valid_folios_lookup_unlocked(valid_folios_set, folio);
 }
 
 static u64 mem_cgroup_page_tracking_nr_entries_read(

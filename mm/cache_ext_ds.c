@@ -107,7 +107,7 @@ int __cache_ext_list_add_impl(struct cache_ext_list* list, struct folio* folio,
   struct valid_folios_set* valid_folios_set = folio_to_valid_folios_set(folio);
   spinlock_t* bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
   spin_lock_irqsave(bucket_lock, flags);
-  struct valid_folio* valid_folio = valid_folios_lookup(folio);
+  struct valid_folio* valid_folio = valid_folios_lookup_unlocked(valid_folios_set, folio);
   if (!valid_folio)
   {
     spin_unlock_irqrestore(bucket_lock, flags);
@@ -151,7 +151,7 @@ int cache_ext_list_move(struct cache_ext_list* list, struct folio* folio,
   struct valid_folios_set* valid_folios_set = folio_to_valid_folios_set(folio);
   spinlock_t* bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
   spin_lock_irqsave(bucket_lock, flags);
-  struct valid_folio* valid_folio = valid_folios_lookup(folio);
+  struct valid_folio* valid_folio = valid_folios_lookup_unlocked(valid_folios_set, folio);
   if (!valid_folio)
   {
     spin_unlock_irqrestore(bucket_lock, flags);
@@ -178,7 +178,7 @@ int cache_ext_list_del(struct folio* folio)
 
   spin_lock_irqsave(bucket_lock, flags);
 
-  struct valid_folio* valid_folio = valid_folios_lookup(folio);
+  struct valid_folio* valid_folio = valid_folios_lookup_unlocked(valid_folios_set, folio);
   if (!valid_folio)
   {
     spin_unlock_irqrestore(bucket_lock, flags);
@@ -1040,7 +1040,7 @@ __bpf_kfunc struct cache_ext_list_node* bpf_cache_ext_folio_to_node(struct folio
   unsigned long flags;
   spin_lock_irqsave(bucket_lock, flags);
 
-  struct valid_folio* vf = valid_folios_lookup(folio);
+  struct valid_folio* vf = valid_folios_lookup_unlocked(vfs, folio);
   struct cache_ext_list_node* node = vf ? vf->cache_ext_node : NULL;
 
   spin_unlock_irqrestore(bucket_lock, flags);
