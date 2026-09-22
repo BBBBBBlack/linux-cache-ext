@@ -6676,27 +6676,46 @@ static unsigned long __cache_ext_isolate_and_reclaim(struct lruvec* lruvec,
     {
       struct folio* untrusted_folio_ptr = ctx.folios_to_evict[i];
       struct cache_ext_list_node* pinned_node = ctx.nodes_to_evict[i];
-      if (!valid_folios_exists_unlocked(lruvec_to_valid_folios_set(lruvec), untrusted_folio_ptr))
+      struct folio* trusted_folio_ptr;
+
+      /*
+       * The policy-visible folio pointer is not trusted by itself.  The
+       * sampling/iterate helpers pin the node and take a folio ref before
+       * returning it here; reclaim must validate through that pinned node
+       * before isolating the folio.  This replaces the old valid_folios_set
+       * hash lookup without losing the UAF guard.
+       */
+      if (!pinned_node)
       {
-        pr_debug("cache_ext: Folio not in valid_folios_set: %p!\n", untrusted_folio_ptr);
+        pr_debug("cache_ext: No pinned node for folio: %p!\n", untrusted_folio_ptr);
         nr_invalid++;
-        if (pinned_node)
-          cache_ext_list_node_unpin(pinned_node);
+        continue;
+      }
+
+      trusted_folio_ptr = READ_ONCE(pinned_node->folio);
+      if (!trusted_folio_ptr ||
+          trusted_folio_ptr != untrusted_folio_ptr ||
+          READ_ONCE(trusted_folio_ptr->cache_ext_node) != pinned_node ||
+          cache_ext_list_node_removed(pinned_node) ||
+          cache_ext_list_node_freed(pinned_node))
+      {
+        pr_debug("cache_ext: Invalid pinned node/folio pair: node=%p folio=%p trusted=%p!\n",
+                 pinned_node, untrusted_folio_ptr, trusted_folio_ptr);
+        nr_invalid++;
+        cache_ext_list_node_unpin(pinned_node);
         continue;
       }
       // Isolate page
-      if (!cache_ext_isolate_folio(untrusted_folio_ptr))
+      if (!cache_ext_isolate_folio(trusted_folio_ptr))
       {
-        pr_debug("cache_ext: Failed to isolate folio: %p\n", untrusted_folio_ptr);
+        pr_debug("cache_ext: Failed to isolate folio: %p\n", trusted_folio_ptr);
         nr_isolate_fail++;
-        if (pinned_node)
-          cache_ext_list_node_unpin(pinned_node);
+        cache_ext_list_node_unpin(pinned_node);
         continue;
       }
-      if (pinned_node)
-        cache_ext_list_node_unpin(pinned_node);
+      cache_ext_list_node_unpin(pinned_node);
       // Free isolated folios
-      list_add(&untrusted_folio_ptr->lru, &free_folios);
+      list_add(&trusted_folio_ptr->lru, &free_folios);
     }
     // TODO: Repurposing this damon function for now. Is it enough?
     nr_reclaimed_for_batch = reclaim_pages(&free_folios);

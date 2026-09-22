@@ -30,6 +30,7 @@
 #define INIT_PASID	0
 
 struct address_space;
+struct cache_ext_list_node;
 struct mem_cgroup;
 
 /*
@@ -185,6 +186,16 @@ struct page {
 #endif
 
 	/*
+	 * cache_ext fast-path pointer.
+	 *
+	 * This mirrors struct folio::cache_ext_node.  It lets cache_ext
+	 * access hooks find per-folio policy metadata without taking the
+	 * valid_folios_set bucket lock and without doing a hash lookup.
+	 * valid_folios_set remains the authoritative registry and fallback.
+	 */
+	struct cache_ext_list_node *cache_ext_node;
+
+	/*
 	 * On machines where all RAM is mapped into kernel address space,
 	 * we can simply calculate the virtual address. On machines with
 	 * highmem some memory is mapped into kernel virtual memory
@@ -318,6 +329,7 @@ struct folio {
 #ifdef CONFIG_MEMCG
 			unsigned long memcg_data;
 #endif
+			struct cache_ext_list_node *cache_ext_node;
 	/* private: the union with struct page is transitional */
 		};
 		struct page page;
@@ -373,6 +385,7 @@ FOLIO_MATCH(_refcount, _refcount);
 #ifdef CONFIG_MEMCG
 FOLIO_MATCH(memcg_data, memcg_data);
 #endif
+FOLIO_MATCH(cache_ext_node, cache_ext_node);
 #undef FOLIO_MATCH
 #define FOLIO_MATCH(pg, fl)						\
 	static_assert(offsetof(struct folio, fl) ==			\

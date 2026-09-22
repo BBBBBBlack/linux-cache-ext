@@ -461,8 +461,11 @@ void folio_mark_accessed(struct folio *folio)
 	struct mem_cgroup *memcg;
 	memcg = folio_memcg(folio);
 	struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
-	if (pcext_ops != NULL && pcext_ops->folio_accessed != NULL)
+	if (pcext_ops != NULL && pcext_ops->folio_accessed != NULL) {
+		rcu_read_lock();
 		pcext_ops->folio_accessed(folio);
+		rcu_read_unlock();
+	}
 
 	if (lru_gen_enabled()) {
 		folio_inc_refs(folio);

@@ -311,13 +311,7 @@ inline struct valid_folios_set *lruvec_to_valid_folios_set(struct lruvec *lruvec
 }
 
 spinlock_t *valid_folios_set_get_bucket_lock(struct valid_folios_set *valid_folios_set, struct folio *folio) {
-	uintptr_t key = folio_ptr_to_key(folio);
-	int bkt = hash_bucket_idx(valid_folios_set->valid_folios, key);
-	if (bkt < 0 || bkt >= VALID_FOLIOS_SET_SIZE) {
-		pr_err("invalid bkt: %d", bkt);
-		BUG();
-	}
-	return &valid_folios_set->bucket_locks[bkt];
+	return NULL;
 }
 
 struct valid_folios_set* init_valid_folios_set(int node, uint64_t num_buckets) {
@@ -328,61 +322,47 @@ struct valid_folios_set* init_valid_folios_set(int node, uint64_t num_buckets) {
 	pr_info("cache_ext: Cgroup sees available memory: %llu B (%llu MB)\n",
 		total_memory_in_bytes, total_memory_in_mbytes);
 	struct valid_folios_set *valid_folios_set;
-	// TODO: Change to vmalloc_node
-	valid_folios_set = vmalloc_huge(sizeof(struct valid_folios_set), GFP_KERNEL | __GFP_ZERO);
+	valid_folios_set = kzalloc(sizeof(struct valid_folios_set), GFP_KERNEL);
 	if (!valid_folios_set) {
 		pr_err("cache_ext: Failed to allocate valid folios set\n");
 		return NULL;
-	}
-	atomic64_set(&valid_folios_set->nr_entries, 0);
-
-	hash_init(valid_folios_set->valid_folios);
-	for (int i = 0; i < VALID_FOLIOS_SET_SIZE; i++) {
-		spin_lock_init(&valid_folios_set->bucket_locks[i]);
 	}
 	return valid_folios_set;
 }
 
 void free_valid_folios_set(struct valid_folios_set *valid_folios_set) {
-	struct valid_folio *cur;
-	struct hlist_node *tmp;
-	int bkt;
 	pr_info("Freeing valid folios set");
-	// TODO: Do we need to lock here?
-	hash_for_each_safe(valid_folios_set->valid_folios, bkt, tmp, cur, h_node) {
-		hash_del(&cur->h_node);
-		kfree(cur);
-	}
-	vfree(valid_folios_set);
+	kfree(valid_folios_set);
 }
 
 void valid_folios_add(struct folio *folio) {
+	struct cache_ext_list_node *node;
+	struct cache_ext_list_node *existing;
+	struct cache_ext_ds_registry *registry;
 	unsigned long flags;
-	struct valid_folio *new = kmalloc(sizeof(struct valid_folio), GFP_NOWAIT);
-	if (!new)
+
+	if (!folio)
 		return;
-	struct cache_ext_list_node *node = cache_ext_list_node_alloc(folio);
+
+	node = cache_ext_list_node_alloc(folio);
 	if (!node) {
-		kfree(new);
 		return;
 	}
-	new->folio_ptr = folio_ptr_to_key(folio);
-	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
-	// Lock the bucket
-	spinlock_t *bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
-	spin_lock_irqsave(bucket_lock, flags);
-	// Use valid_folios_exists function to check if the folio is already in the valid folio hash table
-	if (valid_folios_exists_unlocked(valid_folios_set, folio)) {
-		spin_unlock_irqrestore(bucket_lock, flags);
-		kfree(new);
+
+	registry = cache_ext_ds_registry_from_folio(folio);
+
+	spin_lock_irqsave(&registry->all_nodes_lock, flags);
+	existing = READ_ONCE(folio->cache_ext_node);
+	if (existing) {
+		spin_unlock_irqrestore(&registry->all_nodes_lock, flags);
 		cache_ext_list_node_free(node);
 		return;
 	}
-	// The folio is valid, so we add it to the valid folio hash table
-	new->cache_ext_node = node;
-	hash_add(valid_folios_set->valid_folios, &new->h_node, new->folio_ptr);
-	spin_unlock_irqrestore(bucket_lock, flags);
-	atomic64_fetch_add(1, &valid_folios_set->nr_entries);
+
+	list_add_tail(&node->all_node, &registry->all_nodes);
+	atomic64_inc(&registry->nr_nodes);
+	WRITE_ONCE(folio->cache_ext_node, node);
+	spin_unlock_irqrestore(&registry->all_nodes_lock, flags);
 }
 
 /*
@@ -390,90 +370,68 @@ void valid_folios_add(struct folio *folio) {
  * hash table, do nothing.
  */
 void valid_folios_del(struct folio *folio) {
-	unsigned long flags;
-	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
-	struct valid_folio *cur;
-	spinlock_t *bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
-	spin_lock_irqsave(bucket_lock, flags);
-	uintptr_t key = folio_ptr_to_key(folio);
-	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
-		if (cur->folio_ptr == key) {
-			hash_del(&cur->h_node);
+	struct cache_ext_list_node *node;
+	struct cache_ext_ds_registry *registry;
+	unsigned long reg_flags, flags;
 
-			if (cur->cache_ext_node) {
-				unsigned long reg_flags;
-				reg_flags = cache_ext_ds_registry_write_lock(folio);
-				WRITE_ONCE(cur->cache_ext_node->removed, true);
-				if (!list_empty(&cur->cache_ext_node->node))
-					list_del_init(&cur->cache_ext_node->node);
-				cache_ext_ds_registry_write_unlock(folio, reg_flags);
-				cache_ext_list_node_free(cur->cache_ext_node);
-			}
+	if (!folio)
+		return;
 
-			kfree(cur);
-			spin_unlock_irqrestore(bucket_lock, flags);
-			atomic64_fetch_add(-1, &valid_folios_set->nr_entries);
-			return;
-		}
+	node = READ_ONCE(folio->cache_ext_node);
+	if (!node)
+		return;
+
+	registry = cache_ext_ds_registry_from_folio(folio);
+
+	cache_ext_list_node_mark_removed(node);
+	if (READ_ONCE(folio->cache_ext_node) == node)
+		WRITE_ONCE(folio->cache_ext_node, NULL);
+
+	reg_flags = cache_ext_ds_registry_write_lock(folio);
+	if (!list_empty(&node->node))
+		list_del_init(&node->node);
+	cache_ext_ds_registry_write_unlock(folio, reg_flags);
+
+	spin_lock_irqsave(&registry->all_nodes_lock, flags);
+	if (!list_empty(&node->all_node)) {
+		list_del_init(&node->all_node);
+		atomic64_dec(&registry->nr_nodes);
 	}
-	spin_unlock_irqrestore(bucket_lock, flags);
+	spin_unlock_irqrestore(&registry->all_nodes_lock, flags);
+
+	cache_ext_list_node_free(node);
 }
 
 void valid_folios_clear_list(struct valid_folios_set *valid_folios_set) {
-	// For each bucket:
-	// 1. Lock the bucket
-	// 2. Iterate over the valid folios in the bucket
-	// 3. Set the cache_ext_node pointer to null
-	// 4. Unlock the bucket
-	unsigned long flags;
-	struct valid_folio *cur;
-	spinlock_t *bucket_lock;
-
-	for (int i = 0; i < VALID_FOLIOS_SET_SIZE; i++) {
-		bucket_lock = &valid_folios_set->bucket_locks[i];
-		spin_lock_irqsave(bucket_lock, flags);
-		hlist_for_each_entry(cur, &valid_folios_set->valid_folios[i], h_node) {
-			INIT_LIST_HEAD(&cur->cache_ext_node->node);
-		}
-		spin_unlock_irqrestore(bucket_lock, flags);
-	}
+	/*
+	 * Compatibility no-op.  The real lifetime walk is
+	 * cache_ext_ds_registry::all_nodes and is cleared by
+	 * cache_ext_ds_registry_del_all().
+	 */
 }
 
 bool valid_folios_exists(struct valid_folios_set *valid_folios_set, struct folio *folio) {
-	unsigned long flags;
-	spinlock_t *bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
-	spin_lock_irqsave(bucket_lock, flags);
-	bool ret = valid_folios_exists_unlocked(valid_folios_set, folio);
-	spin_unlock_irqrestore(bucket_lock, flags);
-	return ret;
+	return valid_folios_exists_unlocked(valid_folios_set, folio);
 }
 
 bool valid_folios_exists_unlocked(struct valid_folios_set *valid_folios_set, struct folio *folio) {
-	// TODO: Add read lock.
-	// Use hash_for_each_possible to iterate over the valid folio hash table
-	// and check if the folio is valid
-	struct valid_folio *cur;
-	uintptr_t key = folio_ptr_to_key(folio);
-	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
-		if (cur->folio_ptr == key) {
-			return true;
-		}
-	}
-	return false;
-}
+	struct cache_ext_list_node *node;
 
-u64 valid_folios_get_nr_entries(struct valid_folios_set *valid_folios_set) {
-	return (u64) (atomic64_read(&valid_folios_set->nr_entries));
+	if (!folio)
+		return false;
+
+	node = READ_ONCE(folio->cache_ext_node);
+	if (!node)
+		return false;
+	if (cache_ext_list_node_removed(node) || cache_ext_list_node_freed(node))
+		return false;
+	if (READ_ONCE(node->folio) != folio)
+		return false;
+
+	return true;
 }
 
 struct valid_folio *valid_folios_lookup_unlocked(struct valid_folios_set *valid_folios_set, struct folio *folio) {
-	struct valid_folio *cur;
-	uintptr_t key = folio_ptr_to_key(folio);
-	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
-		if (cur->folio_ptr == key) {
-			return cur;
-		}
-	}
 	return NULL;
 }
 
@@ -481,26 +439,6 @@ struct valid_folio *valid_folios_lookup(struct folio *folio) {
 	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
 	return valid_folios_lookup_unlocked(valid_folios_set, folio);
 }
-
-static u64 mem_cgroup_page_tracking_nr_entries_read(
-	struct cgroup_subsys_state *css, struct cftype *cft)
-{
-	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
-	// Iterate per-node cgroups and add
-	u64 total_entries = 0;
-	struct mem_cgroup_per_node *pn;
-	int nid;
-
-	for_each_node(nid) {
-		pn = memcg->nodeinfo[nid];
-		total_entries += valid_folios_get_nr_entries(pn->valid_folios_set);
-	}
-	return total_entries;
-	return mem_cgroup_swappiness(memcg);
-}
-
-
-
 
 /*
  ******************************************************************************
@@ -5267,6 +5205,7 @@ static int mem_cgroup_slab_show(struct seq_file *m, void *p)
 #endif
 
 static int memory_stat_show(struct seq_file *m, void *v);
+static int cache_ext_reclaim_stat_show(struct seq_file *m, void *v);
 
 static struct cftype mem_cgroup_legacy_files[] = {
 	{
@@ -5393,11 +5332,6 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.private = MEMFILE_PRIVATE(_TCP, RES_MAX_USAGE),
 		.write = mem_cgroup_reset,
 		.read_u64 = mem_cgroup_read_u64,
-	},
-	// New stats for the page tracking hashtable
-	{
-		.name = "page_tracking.nr_entries",
-		.read_u64 = mem_cgroup_page_tracking_nr_entries_read,
 	},
 	{ },	/* terminate */
 };
@@ -5589,6 +5523,8 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 	memcg = kzalloc(struct_size(memcg, nodeinfo, nr_node_ids), GFP_KERNEL);
 	if (!memcg)
 		return ERR_PTR(error);
+	for (i = 0; i < CACHE_EXT_RECLAIM_NR_STATS; i++)
+		atomic64_set(&memcg->cache_ext_reclaim_stats[i], 0);
 
 	memcg->id.id = idr_alloc(&mem_cgroup_idr, NULL,
 				 1, MEM_CGROUP_ID_MAX + 1, GFP_KERNEL);
@@ -6922,6 +6858,23 @@ static int memory_events_local_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+static int cache_ext_reclaim_stat_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	static const char * const names[] = {
+#define CACHE_EXT_RECLAIM_NAME(name) #name,
+		CACHE_EXT_RECLAIM_STATS(CACHE_EXT_RECLAIM_NAME)
+#undef CACHE_EXT_RECLAIM_NAME
+	};
+	int i;
+
+	/* Concurrent batches may publish between reads; use interval deltas. */
+	for (i = 0; i < CACHE_EXT_RECLAIM_NR_STATS; i++)
+		seq_printf(m, "%s %llu\n", names[i],
+			   (unsigned long long)atomic64_read(&memcg->cache_ext_reclaim_stats[i]));
+	return 0;
+}
+
 static int memory_stat_show(struct seq_file *m, void *v)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
@@ -7095,6 +7048,10 @@ static struct cftype memory_files[] = {
 		.seq_show = memory_events_local_show,
 	},
 	{
+		.name = "cache_ext_reclaim_stat",
+		.seq_show = cache_ext_reclaim_stat_show,
+	},
+	{
 		.name = "stat",
 		.seq_show = memory_stat_show,
 	},
@@ -7114,10 +7071,6 @@ static struct cftype memory_files[] = {
 		.name = "reclaim",
 		.flags = CFTYPE_NS_DELEGATABLE,
 		.write = memory_reclaim,
-	},
-	{
-		.name = "page_tracking.nr_entries",
-		.read_u64 = mem_cgroup_page_tracking_nr_entries_read,
 	},
 	{ }	/* terminate */
 };

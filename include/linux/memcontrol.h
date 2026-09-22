@@ -68,23 +68,13 @@ struct mem_cgroup_reclaim_cookie {
 
 bool cache_ext_cgroup_enabled(struct cgroup *cgroup);
 
-/*
- * valid_folios is a set of valid folio counters in the system. It's used to
- * validate untrusted page references.
- *
- * Key: Pointer interpreted as a number.
- * Value: Nothing, we just want to check for existence.
- */
-
-// Support up to 20 GiB of memory
-// Each bucket represents 4KiB of memory.
-#define VALID_FOLIOS_SET_SIZE_POW 23
-#define VALID_FOLIOS_SET_SIZE (1 << VALID_FOLIOS_SET_SIZE_POW)
-
 struct valid_folios_set {
-	DECLARE_HASHTABLE(valid_folios, VALID_FOLIOS_SET_SIZE_POW);
-	spinlock_t bucket_locks[VALID_FOLIOS_SET_SIZE];
-	atomic64_t nr_entries;
+	/*
+	 * Compatibility shell.  The folio -> cache_ext_node mapping is stored
+	 * directly in struct folio now; all-node traversal lives in
+	 * cache_ext_ds_registry::all_nodes.
+	 */
+	bool dummy;
 };
 
 struct valid_folio {
@@ -102,6 +92,7 @@ bool valid_folios_exists(struct valid_folios_set *valid_folios_set, struct folio
 bool valid_folios_exists_unlocked(struct valid_folios_set *valid_folios_set, struct folio *folio);
 struct valid_folios_set * lruvec_to_valid_folios_set(struct lruvec *lruvec);
 struct cache_ext_ops *get_cache_ext_ops(struct mem_cgroup *memcg);
+struct valid_folio *valid_folios_lookup_unlocked(struct valid_folios_set *valid_folios_set, struct folio *folio);
 struct valid_folio *valid_folios_lookup(struct folio *folio);
 struct valid_folios_set *folio_to_valid_folios_set(struct folio *folio);
 spinlock_t *valid_folios_set_get_bucket_lock(struct valid_folios_set *valid_folios_set, struct folio *folio);
@@ -384,6 +375,7 @@ struct mem_cgroup {
 #endif
 
 	bool cache_ext_valid;
+	atomic64_t cache_ext_reclaim_stats[CACHE_EXT_RECLAIM_NR_STATS];
 
 	struct mem_cgroup_per_node *nodeinfo[];
 };
