@@ -15,12 +15,21 @@
 
 typedef u64 (*bpf_callback_t)(u64, u64, u64, u64, u64);
 
-/* Local to the reclaiming memcg, not hierarchical. Page counts use PAGE_SIZE.
- * keep_* reasons are mutually exclusive terminal outcomes per reclaim attempt.
- * Accumulate on the stack and publish once per cache_ext reclaim invocation.
+/* Local to the reclaiming memcg, not hierarchical. Counters ending in _pages
+ * are page counts in PAGE_SIZE units; calls, *_calls, and *_folios are event or
+ * folio counts. keep_* reasons are mutually exclusive terminal outcomes per
+ * reclaim attempt. Accumulate on the stack and publish once per cache_ext
+ * reclaim invocation.
  */
 #define CACHE_EXT_RECLAIM_STATS(X) \
   X(calls) \
+  X(requested_pages) \
+  X(returned_folios) \
+  X(returned_pages) \
+  X(short_return_calls) \
+  X(zero_return_calls) \
+  X(fallback_calls) \
+  X(fallback_scan_pages) \
   X(submitted_folios) \
   X(submitted_pages) \
   X(reclaimed_pages) \
@@ -38,7 +47,11 @@ typedef u64 (*bpf_callback_t)(u64, u64, u64, u64, u64);
   X(keep_no_mapping_pages) \
   X(keep_refcount_pages) \
   X(keep_redirtied_pages) \
-  X(keep_other_pages)
+  X(keep_other_pages) \
+  X(deferred_marked_pages) \
+  X(deferred_still_dirty_pages) \
+  X(deferred_clean_pages) \
+  X(deferred_revisit_still_dirty_pages)
 
 enum cache_ext_reclaim_stat_item {
 #define CACHE_EXT_RECLAIM_ENUM(name) CACHE_EXT_RECLAIM_##name,
@@ -105,6 +118,12 @@ struct cache_ext_list_node
 
 #define CACHE_EXT_NODE_REMOVED BIT(0)
 #define CACHE_EXT_NODE_FREED   BIT(1)
+#define CACHE_EXT_NODE_RECLAIM_DEFERRED BIT(2)
+#define CACHE_EXT_NODE_RECENT_DEFERRED  BIT(3)
+/* Historical successful policy-list admission, NOT current membership.
+ * Set under registry->lock and retained until this node is freed.
+ */
+#define CACHE_EXT_NODE_EVER_ADMITTED BIT(4)
 
 static inline bool cache_ext_list_node_removed(struct cache_ext_list_node* node)
 {
@@ -116,9 +135,39 @@ static inline bool cache_ext_list_node_freed(struct cache_ext_list_node* node)
   return atomic_read(&node->state) & CACHE_EXT_NODE_FREED;
 }
 
+static inline bool cache_ext_list_node_reclaim_deferred(struct cache_ext_list_node* node)
+{
+  return atomic_read(&node->state) & CACHE_EXT_NODE_RECLAIM_DEFERRED;
+}
+
+static inline bool cache_ext_list_node_recent_deferred(struct cache_ext_list_node* node)
+{
+  return atomic_read(&node->state) & CACHE_EXT_NODE_RECENT_DEFERRED;
+}
+
 static inline void cache_ext_list_node_mark_removed(struct cache_ext_list_node* node)
 {
   atomic_or(CACHE_EXT_NODE_REMOVED, &node->state);
+}
+
+static inline void cache_ext_list_node_mark_reclaim_deferred(struct cache_ext_list_node* node)
+{
+  atomic_or(CACHE_EXT_NODE_RECLAIM_DEFERRED, &node->state);
+}
+
+static inline void cache_ext_list_node_mark_recent_deferred(struct cache_ext_list_node* node)
+{
+  atomic_or(CACHE_EXT_NODE_RECENT_DEFERRED, &node->state);
+}
+
+static inline void cache_ext_list_node_clear_reclaim_deferred(struct cache_ext_list_node* node)
+{
+  atomic_andnot(CACHE_EXT_NODE_RECLAIM_DEFERRED, &node->state);
+}
+
+static inline void cache_ext_list_node_clear_recent_deferred(struct cache_ext_list_node* node)
+{
+  atomic_andnot(CACHE_EXT_NODE_RECENT_DEFERRED, &node->state);
 }
 
 static inline bool cache_ext_list_node_try_mark_freed(struct cache_ext_list_node* node)
@@ -138,6 +187,26 @@ struct sampling_options
   __u32 select_size;
 };
 
+struct cache_ext_sample_opts
+{
+  __u32 sample_size;
+  __u32 reserved;
+
+  u64 sampled_list;
+  u64 sampled_mode;
+
+  u64 evict_list;
+  u64 evict_mode;
+
+  u64 deferred_list;
+  u64 deferred_mode;
+
+  u64 nr_folios_sampled;
+  u64 nr_folios_evicted;
+  u64 nr_folios_deferred;
+  u64 nr_folios_unselectable;
+};
+
 int bpf_cache_ext_list_add(u64 list, struct folio* folio);
 int bpf_cache_ext_list_add_tail(u64 list, struct folio* folio);
 int bpf_cache_ext_list_move(u64 list, struct folio* folio, bool tail);
@@ -154,6 +223,10 @@ int bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
                               s64(score_fn)(struct cache_ext_list_node* a),
                               struct sampling_options* opts,
                               struct cache_ext_eviction_ctx* ctx);
+int bpf_cache_ext_list_sample_extended(struct mem_cgroup* memcg, u64 list,
+                                       s64(score_fn)(struct cache_ext_list_node* a),
+                                       struct cache_ext_sample_opts* opts,
+                                       struct cache_ext_eviction_ctx* ctx);
 u64 bpf_cache_ext_ds_registry_new_list(struct mem_cgroup* memcg);
 
 /*

@@ -204,6 +204,8 @@ static void evict_main_iter(struct cache_ext_eviction_ctx *eviction_ctx, struct 
 		.continue_mode = CACHE_EXT_ITERATE_TAIL,
 		.evict_list = CACHE_EXT_ITERATE_SELF,
 		.evict_mode = CACHE_EXT_ITERATE_TAIL,
+		.deferred_list = CACHE_EXT_ITERATE_SELF,
+		.deferred_mode = CACHE_EXT_ITERATE_TAIL,
 	};
 
 	if (bpf_cache_ext_list_iterate_extended(memcg, main_list, bpf_s3fifo_score_main_iter_fn_0, &opts,
@@ -255,6 +257,8 @@ static void evict_small(struct cache_ext_eviction_ctx *eviction_ctx, struct mem_
 		.continue_mode = CACHE_EXT_ITERATE_TAIL,
 		.evict_list = CACHE_EXT_ITERATE_SELF,
 		.evict_mode = CACHE_EXT_ITERATE_TAIL,
+		.deferred_list = CACHE_EXT_ITERATE_SELF,
+		.deferred_mode = CACHE_EXT_ITERATE_TAIL,
 	};
 
 	if (bpf_cache_ext_list_iterate_extended(memcg, small_list, bpf_s3fifo_score_small_fn, &opts,

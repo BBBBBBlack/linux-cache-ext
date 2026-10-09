@@ -80,6 +80,9 @@ struct scan_control
   /* How many pages shrink_list() should reclaim */
   unsigned long nr_to_reclaim;
 
+  /* Non-NULL only for candidates explicitly submitted by cache_ext. */
+  struct cache_ext_reclaim_stats *cache_ext_stats;
+
   /*
    * Nodemask of nodes allowed by the caller. If NULL, all nodes
    * are scanned.
@@ -1433,7 +1436,8 @@ static pageout_t pageout(struct folio* folio, struct address_space* mapping,
  * gets returned with a refcount of 0.
  */
 static int __remove_mapping(struct address_space* mapping, struct folio* folio,
-                            bool reclaimed, struct mem_cgroup* target_memcg)
+                            bool reclaimed, struct mem_cgroup* target_memcg,
+                            enum cache_ext_reclaim_stat_item *keep_reason)
 {
   int refcount;
   void* shadow = NULL;
@@ -1473,10 +1477,16 @@ static int __remove_mapping(struct address_space* mapping, struct folio* folio,
   // TODO: Maybe we need to be getting a refcount in valid_folios_set and
   // be dropping it here.
   if (!folio_ref_freeze(folio, refcount))
+  {
+    if (keep_reason)
+      *keep_reason = CACHE_EXT_RECLAIM_keep_refcount_pages;
     goto cannot_free;
+  }
   /* note: atomic_cmpxchg in folio_ref_freeze provides the smp_rmb */
   if (unlikely(folio_test_dirty(folio)))
   {
+    if (keep_reason)
+      *keep_reason = CACHE_EXT_RECLAIM_keep_redirtied_pages;
     folio_ref_unfreeze(folio, refcount);
     goto cannot_free;
   }
@@ -1549,7 +1559,7 @@ cannot_free:
  */
 long remove_mapping(struct address_space* mapping, struct folio* folio)
 {
-  if (__remove_mapping(mapping, folio, false, NULL))
+  if (__remove_mapping(mapping, folio, false, NULL, NULL))
   {
     /*
      * Unfreezing the refcount with 1 effectively
@@ -1560,6 +1570,22 @@ long remove_mapping(struct address_space* mapping, struct folio* folio)
     return folio_nr_pages(folio);
   }
   return 0;
+}
+
+static bool cache_ext_keep_reason_is_writeback_related(
+    enum cache_ext_reclaim_stat_item keep_reason)
+{
+  switch (keep_reason)
+  {
+  case CACHE_EXT_RECLAIM_keep_writeback_pages:
+  case CACHE_EXT_RECLAIM_keep_dirty_pages:
+  case CACHE_EXT_RECLAIM_keep_fs_restricted_pages:
+  case CACHE_EXT_RECLAIM_keep_pageout_pages:
+  case CACHE_EXT_RECLAIM_keep_redirtied_pages:
+    return true;
+  default:
+    return false;
+  }
 }
 
 /**
@@ -1789,6 +1815,7 @@ retry:
     struct address_space* mapping;
     struct folio* folio;
     enum folio_references references = FOLIOREF_RECLAIM;
+    enum cache_ext_reclaim_stat_item keep_reason = CACHE_EXT_RECLAIM_keep_other_pages;
     bool dirty, writeback;
     unsigned int nr_pages;
 
@@ -1798,7 +1825,10 @@ retry:
     list_del(&folio->lru);
 
     if (!folio_trylock(folio))
+    {
+      keep_reason = CACHE_EXT_RECLAIM_keep_lock_pages;
       goto keep;
+    }
 
     VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
 
@@ -1808,15 +1838,24 @@ retry:
     sc->nr_scanned += nr_pages;
 
     if (unlikely(!folio_evictable(folio)))
+    {
+      keep_reason = CACHE_EXT_RECLAIM_keep_unevictable_pages;
       goto activate_locked;
+    }
 
     if (!sc->may_unmap && folio_mapped(folio))
+    {
+      keep_reason = CACHE_EXT_RECLAIM_keep_unmap_pages;
       goto keep_locked;
+    }
 
     /* folio_update_gen() tried to promote this page? */
     if (lru_gen_enabled() && !ignore_references &&
         folio_mapped(folio) && folio_test_referenced(folio))
+    {
+      keep_reason = CACHE_EXT_RECLAIM_keep_reference_keep_pages;
       goto keep_locked;
+    }
 
     /*
      * The number of dirty pages determines if a node is marked
@@ -1885,6 +1924,7 @@ retry:
      */
     if (folio_test_writeback(folio))
     {
+      keep_reason = CACHE_EXT_RECLAIM_keep_writeback_pages;
       /* Case 1 above */
       if (current_is_kswapd() &&
           folio_test_reclaim(folio) &&
@@ -1935,8 +1975,10 @@ retry:
     switch (references)
     {
     case FOLIOREF_ACTIVATE:
+      keep_reason = CACHE_EXT_RECLAIM_keep_reference_activate_pages;
       goto activate_locked;
     case FOLIOREF_KEEP:
+      keep_reason = CACHE_EXT_RECLAIM_keep_reference_keep_pages;
       stat->nr_ref_keep += nr_pages;
       goto keep_locked;
     case FOLIOREF_RECLAIM:
@@ -2033,6 +2075,7 @@ retry:
       try_to_unmap(folio, flags);
       if (folio_mapped(folio))
       {
+        keep_reason = CACHE_EXT_RECLAIM_keep_unmap_pages;
         stat->nr_unmap_fail += nr_pages;
         if (!was_swapbacked &&
             folio_test_swapbacked(folio))
@@ -2049,11 +2092,15 @@ retry:
      * pinning process as that may upset the filesystem.
      */
     if (folio_maybe_dma_pinned(folio))
+    {
+      keep_reason = CACHE_EXT_RECLAIM_keep_dma_pinned_pages;
       goto activate_locked;
+    }
 
     mapping = folio_mapping(folio);
     if (folio_test_dirty(folio))
     {
+      keep_reason = CACHE_EXT_RECLAIM_keep_dirty_pages;
       /*
        * Only kswapd can writeback filesystem folios
        * to avoid risk of stack overflow. But avoid
@@ -2086,9 +2133,15 @@ retry:
       if (references == FOLIOREF_RECLAIM_CLEAN)
         goto keep_locked;
       if (!may_enter_fs(folio, sc->gfp_mask))
+      {
+        keep_reason = CACHE_EXT_RECLAIM_keep_fs_restricted_pages;
         goto keep_locked;
+      }
       if (!sc->may_writepage)
+      {
+        keep_reason = CACHE_EXT_RECLAIM_keep_fs_restricted_pages;
         goto keep_locked;
+      }
 
       /*
        * Folio is dirty. Flush the TLB if a writable entry
@@ -2099,14 +2152,19 @@ retry:
       switch (pageout(folio, mapping, &plug))
       {
       case PAGE_KEEP:
+        keep_reason = CACHE_EXT_RECLAIM_keep_pageout_pages;
         goto keep_locked;
       case PAGE_ACTIVATE:
+        keep_reason = CACHE_EXT_RECLAIM_keep_pageout_pages;
         goto activate_locked;
       case PAGE_SUCCESS:
         stat->nr_pageout += nr_pages;
 
         if (folio_test_writeback(folio))
+        {
+          keep_reason = CACHE_EXT_RECLAIM_keep_writeback_pages;
           goto keep;
+        }
         if (folio_test_dirty(folio))
           goto keep;
 
@@ -2115,10 +2173,20 @@ retry:
          * ahead and try to reclaim the folio.
          */
         if (!folio_trylock(folio))
+        {
+          keep_reason = CACHE_EXT_RECLAIM_keep_lock_pages;
           goto keep;
-        if (folio_test_dirty(folio) ||
-            folio_test_writeback(folio))
+        }
+        if (folio_test_dirty(folio))
+        {
+          keep_reason = CACHE_EXT_RECLAIM_keep_dirty_pages;
           goto keep_locked;
+        }
+        if (folio_test_writeback(folio))
+        {
+          keep_reason = CACHE_EXT_RECLAIM_keep_writeback_pages;
+          goto keep_locked;
+        }
         mapping = folio_mapping(folio);
         fallthrough;
       case PAGE_CLEAN:; /* try to free the folio below */
@@ -2151,7 +2219,10 @@ retry:
     if (folio_needs_release(folio))
     {
       if (!filemap_release_folio(folio, sc->gfp_mask))
+      {
+        keep_reason = CACHE_EXT_RECLAIM_keep_release_pages;
         goto activate_locked;
+      }
       if (!mapping && folio_ref_count(folio) == 1)
       {
         folio_unlock(folio);
@@ -2176,7 +2247,10 @@ retry:
     {
       /* follow __remove_mapping for reference */
       if (!folio_ref_freeze(folio, 1))
+      {
+        keep_reason = CACHE_EXT_RECLAIM_keep_refcount_pages;
         goto keep_locked;
+      }
       /*
        * The folio has only one reference left, which is
        * from the isolation. After the caller puts the
@@ -2188,9 +2262,17 @@ retry:
       count_vm_events(PGLAZYFREED, nr_pages);
       count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
     }
-    else if (!mapping || !__remove_mapping(mapping, folio, true,
-                                           sc->target_mem_cgroup))
-      goto keep_locked;
+    else
+    {
+      if (!mapping)
+      {
+        keep_reason = CACHE_EXT_RECLAIM_keep_no_mapping_pages;
+        goto keep_locked;
+      }
+      if (!__remove_mapping(mapping, folio, true, sc->target_mem_cgroup,
+                            sc->cache_ext_stats ? &keep_reason : NULL))
+        goto keep_locked;
+    }
 
     folio_unlock(folio);
   free_it:
@@ -2236,6 +2318,25 @@ retry:
   keep_locked:
     folio_unlock(folio);
   keep:
+    /* Count a terminal outcome once, including lock failures before nr_pages
+     * is initialized. No atomics or printk in this per-folio path.
+     */
+    if (sc->cache_ext_stats)
+    {
+      struct cache_ext_list_node* node = READ_ONCE(folio->cache_ext_node);
+
+      sc->cache_ext_stats->count[keep_reason] += folio_nr_pages(folio);
+      if (node && READ_ONCE(node->folio) == folio &&
+          !cache_ext_list_node_removed(node) &&
+          !cache_ext_list_node_freed(node) &&
+          cache_ext_keep_reason_is_writeback_related(keep_reason) &&
+          (folio_test_dirty(folio) || folio_test_writeback(folio)))
+      {
+        cache_ext_list_node_mark_reclaim_deferred(node);
+        sc->cache_ext_stats->count[CACHE_EXT_RECLAIM_deferred_marked_pages] +=
+            folio_nr_pages(folio);
+      }
+    }
     list_add(&folio->lru, &ret_folios);
     VM_BUG_ON_FOLIO(folio_test_lru(folio) ||
                         folio_test_unevictable(folio),
@@ -2904,21 +3005,49 @@ static void shrink_active_list(unsigned long nr_to_scan,
                                     nr_deactivate, nr_rotated, sc->priority, file);
 }
 
-static unsigned int reclaim_folio_list(struct list_head* folio_list,
-                                       struct pglist_data* pgdat)
+static void cache_ext_reclaim_stat_add(struct reclaim_stat* total,
+                                       const struct reclaim_stat* stat)
 {
-  struct reclaim_stat dummy_stat;
+  total->nr_dirty += stat->nr_dirty;
+  total->nr_unqueued_dirty += stat->nr_unqueued_dirty;
+  total->nr_congested += stat->nr_congested;
+  total->nr_writeback += stat->nr_writeback;
+  total->nr_immediate += stat->nr_immediate;
+  total->nr_pageout += stat->nr_pageout;
+  total->nr_activate[0] += stat->nr_activate[0];
+  total->nr_activate[1] += stat->nr_activate[1];
+  total->nr_ref_keep += stat->nr_ref_keep;
+  total->nr_unmap_fail += stat->nr_unmap_fail;
+  total->nr_lazyfree_fail += stat->nr_lazyfree_fail;
+}
+
+static unsigned int reclaim_folio_list(struct list_head* folio_list,
+                                       struct pglist_data* pgdat,
+                                       struct cache_ext_reclaim_stats* stats,
+                                       struct scan_control* outer_sc,
+                                       struct reclaim_stat* stat_out)
+{
+  struct reclaim_stat stat = { };
   unsigned int nr_reclaimed;
   struct folio* folio;
-  struct scan_control sc = {
+  struct cache_ext_reclaim_stats* saved_cache_ext_stats;
+  struct scan_control local_sc = {
       .gfp_mask = GFP_KERNEL,
       .may_writepage = 1,
       .may_unmap = 1,
       .may_swap = 1,
       .no_demotion = 1,
   };
+  struct scan_control* sc = outer_sc ? outer_sc : &local_sc;
 
-  nr_reclaimed = shrink_folio_list(folio_list, pgdat, &sc, &dummy_stat, false);
+  saved_cache_ext_stats = sc->cache_ext_stats;
+  sc->cache_ext_stats = stats;
+  nr_reclaimed = shrink_folio_list(folio_list, pgdat, sc, &stat, false);
+  sc->cache_ext_stats = saved_cache_ext_stats;
+
+  if (stat_out)
+    cache_ext_reclaim_stat_add(stat_out, &stat);
+
   while (!list_empty(folio_list))
   {
     folio = lru_to_folio(folio_list);
@@ -2929,7 +3058,10 @@ static unsigned int reclaim_folio_list(struct list_head* folio_list,
   return nr_reclaimed;
 }
 
-unsigned long reclaim_pages(struct list_head* folio_list)
+static unsigned long reclaim_pages_with_stats(struct list_head* folio_list,
+                                               struct cache_ext_reclaim_stats* stats,
+                                               struct scan_control* sc,
+                                               struct reclaim_stat* stat)
 {
   int nid;
   unsigned int nr_reclaimed = 0;
@@ -2953,15 +3085,22 @@ unsigned long reclaim_pages(struct list_head* folio_list)
       continue;
     }
 
-    nr_reclaimed += reclaim_folio_list(&node_folio_list, NODE_DATA(nid));
+    nr_reclaimed += reclaim_folio_list(&node_folio_list, NODE_DATA(nid),
+                                       stats, sc, stat);
     nid = folio_nid(lru_to_folio(folio_list));
   } while (!list_empty(folio_list));
 
-  nr_reclaimed += reclaim_folio_list(&node_folio_list, NODE_DATA(nid));
+  nr_reclaimed += reclaim_folio_list(&node_folio_list, NODE_DATA(nid),
+                                     stats, sc, stat);
 
   memalloc_noreclaim_restore(noreclaim_flag);
 
   return nr_reclaimed;
+}
+
+unsigned long reclaim_pages(struct list_head* folio_list)
+{
+  return reclaim_pages_with_stats(folio_list, NULL, NULL, NULL);
 }
 
 static noinline unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
@@ -6606,89 +6745,87 @@ static bool cache_ext_isolate_folio(struct folio* folio)
   if (folio_test_anon(folio))
   {
     if (folio_test_active(folio))
-    {
       lru = LRU_ACTIVE_ANON;
-    }
     else
-    {
       lru = LRU_INACTIVE_ANON;
-    }
   }
   else
   {
     if (folio_test_active(folio))
-    {
       lru = LRU_ACTIVE_FILE;
-    }
     else
-    {
       lru = LRU_INACTIVE_FILE;
-    }
   }
 
   /* remove from list */
   list_del(&folio->lru);
-  // TODO: Update lru size
   long nr_pages = folio_nr_pages(folio);
   update_lru_size(lruvec, lru, folio_zonenum(folio), -nr_pages);
   unlock_page_lruvec_irq(lruvec);
   return true;
 }
 
-static unsigned long __cache_ext_isolate_and_reclaim(struct lruvec* lruvec,
-                                                     long request_nr_to_evict, struct cache_ext_ops* pcext_ops)
+static noinline unsigned long __cache_ext_isolate_and_reclaim(struct lruvec* lruvec,
+                                                     long request_nr_to_evict, struct cache_ext_ops* pcext_ops,
+                                                     struct cache_ext_reclaim_stats* stats,
+                                                     struct scan_control* sc)
 {
 
   int ret = 0;
   LIST_HEAD(free_folios);
   unsigned long nr_reclaimed = 0, nr_reclaimed_for_batch = 0;
+  unsigned long nr_taken_pages = 0, nr_file_taken_pages = 0;
+  struct reclaim_stat total_reclaim_stat = { };
   struct cache_ext_eviction_ctx ctx;
-  unsigned long total_requested = 0, total_returned = 0;
-  unsigned long nr_invalid = 0, nr_isolate_fail = 0;
-  unsigned long nr_batches = 0;
   pr_debug("cache_ext: Trying to evict %lu pages\n", request_nr_to_evict);
   while (request_nr_to_evict > 0)
   {
     long request_nr_to_evict_batch = min((long)32, request_nr_to_evict);
+    unsigned long batch_taken_pages = 0;
+    unsigned long batch_file_taken_pages = 0;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.request_nr_folios_to_evict = request_nr_to_evict_batch;
     pcext_ops->evict_folios(&ctx, lruvec_memcg(lruvec));
-    nr_batches++;
-    total_requested += request_nr_to_evict_batch;
-    total_returned += ctx.nr_folios_to_evict;
+    stats->count[CACHE_EXT_RECLAIM_requested_pages] +=
+        request_nr_to_evict_batch;
     if (ctx.nr_folios_to_evict > ARRAY_SIZE(ctx.folios_to_evict))
     {
       pr_debug("cache_ext: nr_folios_evicted bigger than array size!\n");
       ret = 0;
       goto free;
     }
+    stats->count[CACHE_EXT_RECLAIM_returned_folios] +=
+        ctx.nr_folios_to_evict;
     if (ctx.nr_folios_to_evict == 0)
     {
       pr_debug_ratelimited("cache_ext: No pages to evict, nr_folios_to_evict == 0!\n");
+      stats->count[CACHE_EXT_RECLAIM_zero_return_calls]++;
     }
     if (ctx.nr_folios_to_evict != request_nr_to_evict_batch)
     {
       pr_debug("cache_ext: nr_folios_returned_for_eviction(%lu) != nr_folios_requested_for_eviction(%lu)!\n",
                ctx.nr_folios_to_evict, request_nr_to_evict_batch);
     }
+    if (ctx.nr_folios_to_evict < request_nr_to_evict_batch)
+    {
+      stats->count[CACHE_EXT_RECLAIM_short_return_calls]++;
+    }
     for (int i = 0; i < ctx.nr_folios_to_evict; i++)
     {
       struct folio* untrusted_folio_ptr = ctx.folios_to_evict[i];
       struct cache_ext_list_node* pinned_node = ctx.nodes_to_evict[i];
       struct folio* trusted_folio_ptr;
+      unsigned long nr_pages;
 
       /*
-       * The policy-visible folio pointer is not trusted by itself.  The
-       * sampling/iterate helpers pin the node and take a folio ref before
-       * returning it here; reclaim must validate through that pinned node
-       * before isolating the folio.  This replaces the old valid_folios_set
-       * hash lookup without losing the UAF guard.
+       * The policy-visible folio pointer is not trusted by itself. The
+       * helpers pin the node and take a folio ref before returning it here.
+       * Validate through that pinned node before isolating the folio.
        */
       if (!pinned_node)
       {
         pr_debug("cache_ext: No pinned node for folio: %p!\n", untrusted_folio_ptr);
-        nr_invalid++;
         continue;
       }
 
@@ -6701,47 +6838,87 @@ static unsigned long __cache_ext_isolate_and_reclaim(struct lruvec* lruvec,
       {
         pr_debug("cache_ext: Invalid pinned node/folio pair: node=%p folio=%p trusted=%p!\n",
                  pinned_node, untrusted_folio_ptr, trusted_folio_ptr);
-        nr_invalid++;
         cache_ext_list_node_unpin(pinned_node);
         continue;
       }
-      // Isolate page
+      nr_pages = folio_nr_pages(trusted_folio_ptr);
+      stats->count[CACHE_EXT_RECLAIM_returned_pages] += nr_pages;
       if (!cache_ext_isolate_folio(trusted_folio_ptr))
       {
         pr_debug("cache_ext: Failed to isolate folio: %p\n", trusted_folio_ptr);
-        nr_isolate_fail++;
         cache_ext_list_node_unpin(pinned_node);
         continue;
       }
       cache_ext_list_node_unpin(pinned_node);
-      // Free isolated folios
+      batch_taken_pages += nr_pages;
+      if (folio_is_file_lru(trusted_folio_ptr))
+        batch_file_taken_pages += nr_pages;
+      stats->count[CACHE_EXT_RECLAIM_submitted_folios]++;
+      stats->count[CACHE_EXT_RECLAIM_submitted_pages] += nr_pages;
       list_add(&trusted_folio_ptr->lru, &free_folios);
     }
-    // TODO: Repurposing this damon function for now. Is it enough?
-    nr_reclaimed_for_batch = reclaim_pages(&free_folios);
-    if (nr_reclaimed_for_batch != ctx.nr_folios_to_evict)
+    nr_reclaimed_for_batch = reclaim_pages_with_stats(&free_folios, stats,
+                                                       sc, &total_reclaim_stat);
+    nr_taken_pages += batch_taken_pages;
+    nr_file_taken_pages += batch_file_taken_pages;
+    if (nr_reclaimed_for_batch != batch_taken_pages)
     {
-      pr_debug("cache_ext: nr_reclaimed(%lu) != request_nr_to_evict(%lu)!\n", nr_reclaimed_for_batch, ctx.nr_folios_to_evict);
+      pr_debug("cache_ext: nr_reclaimed_pages(%lu) != submitted_pages(%lu)!\n",
+               nr_reclaimed_for_batch, batch_taken_pages);
     }
     nr_reclaimed += nr_reclaimed_for_batch;
     request_nr_to_evict -= request_nr_to_evict_batch;
   }
 
-  pr_info_ratelimited("cache_ext evict: batches=%lu req=%lu returned=%lu reclaimed=%lu invalid=%lu isolate_fail=%lu\n",
-                      nr_batches, total_requested, total_returned, nr_reclaimed, nr_invalid, nr_isolate_fail);
   pr_debug("cache_ext: Reclaimed %lu pages\n", nr_reclaimed);
   // TODO: Add some watchdog mechanism. If the hook is not performing adequetely, skip it.
 free:
+  /*
+   * Mirror shrink_inactive_list()'s dirty/writeback feedback.  Wake the
+   * flushers at most once per cache_ext reclaim invocation when every page
+   * actually isolated by cache_ext was dirty and not yet queued for I/O.
+   */
+  if (nr_taken_pages &&
+      total_reclaim_stat.nr_unqueued_dirty == nr_taken_pages)
+  {
+    wakeup_flusher_threads(WB_REASON_VMSCAN);
+    if (!writeback_throttling_sane(sc))
+      reclaim_throttle(lruvec_pgdat(lruvec), VMSCAN_THROTTLE_WRITEBACK);
+  }
+
+  sc->nr.dirty += total_reclaim_stat.nr_dirty;
+  sc->nr.congested += total_reclaim_stat.nr_congested;
+  sc->nr.unqueued_dirty += total_reclaim_stat.nr_unqueued_dirty;
+  sc->nr.writeback += total_reclaim_stat.nr_writeback;
+  sc->nr.immediate += total_reclaim_stat.nr_immediate;
+  sc->nr.taken += nr_taken_pages;
+  sc->nr.file_taken += nr_file_taken_pages;
+
   return nr_reclaimed;
 }
 
-static noinline unsigned long cache_ext_isolate_and_reclaim(struct lruvec* lruvec, unsigned long nr_to_evict)
+static noinline unsigned long cache_ext_isolate_and_reclaim(struct lruvec* lruvec,
+                                                            unsigned long nr_to_evict,
+                                                            struct scan_control* sc,
+                                                            bool* active)
 {
   struct mem_cgroup* memcg = lruvec_memcg(lruvec);
   struct cache_ext_ops* pcext_ops = get_cache_ext_ops(memcg);
-  if (pcext_ops != NULL && pcext_ops->evict_folios != NULL)
+
+  *active = pcext_ops != NULL && pcext_ops->evict_folios != NULL;
+  if (*active)
   {
-    return __cache_ext_isolate_and_reclaim(lruvec, nr_to_evict, pcext_ops);
+    struct cache_ext_reclaim_stats stats = { };
+    unsigned long reclaimed;
+
+    reclaimed = __cache_ext_isolate_and_reclaim(lruvec, nr_to_evict,
+                                                pcext_ops, &stats, sc);
+    stats.count[CACHE_EXT_RECLAIM_calls] = 1;
+    stats.count[CACHE_EXT_RECLAIM_reclaimed_pages] = reclaimed;
+    for (int i = 0; i < CACHE_EXT_RECLAIM_NR_STATS; i++)
+      if (stats.count[i])
+        atomic64_add(stats.count[i], &memcg->cache_ext_reclaim_stats[i]);
+    return reclaimed;
   }
   return 0;
 }
@@ -6789,54 +6966,50 @@ static void shrink_lruvec(struct lruvec* lruvec, struct scan_control* sc)
   /*
    * Page cache extension
    */
-  unsigned long nr_to_evict = nr[LRU_INACTIVE_FILE];
-  nr_reclaimed += cache_ext_isolate_and_reclaim(lruvec, nr_to_evict);
-  if (nr_reclaimed > nr[LRU_INACTIVE_FILE])
-  {
-    nr[LRU_INACTIVE_FILE] = 0;
-  }
-  else
-  {
-    nr[LRU_INACTIVE_FILE] -= nr_reclaimed;
-  }
+  unsigned long file_scan_budget = nr[LRU_INACTIVE_FILE];
+  unsigned long remaining_to_reclaim;
+  unsigned long cache_ext_target;
+  unsigned long cache_ext_reclaimed;
+  bool cache_ext_active;
 
-  // TODO: nr[LRU_INACTIVE_FILE] is actually the number of pages to scan, not
-  // the number of pages to evict. Might need to fix this in the future.
-  if (nr[LRU_INACTIVE_FILE] > 1500)
-  {
-    pr_debug("cache_ext: Got a lot of pages to evict: %lu. Is that normal?\n",
-             nr[LRU_INACTIVE_FILE]);
-  }
-  // If we more or less evicted all the pages we wanted, exit.
-  // Assumptions:
-  // - No swap.
-  // - Unmaintained active list is ok.
+  if (sc->nr_reclaimed >= sc->nr_to_reclaim)
+    remaining_to_reclaim = 0;
+  else
+    remaining_to_reclaim = sc->nr_to_reclaim - sc->nr_reclaimed;
 
-  unsigned long long threshold_pct = 80;
-  unsigned long long reclaim_pct = 0;
-  if (nr_to_evict > 0)
+  cache_ext_target = min(file_scan_budget, remaining_to_reclaim);
+  cache_ext_reclaimed =
+      cache_ext_isolate_and_reclaim(lruvec, cache_ext_target, sc,
+                                    &cache_ext_active);
+  if (cache_ext_active)
   {
-    reclaim_pct = 100 * nr_reclaimed / nr_to_evict;
-  }
-  else
-  {
-    pr_debug("cache_ext: nr_to_evict is 0. Falling back to kernel scan\n");
-    reclaim_pct = 0;
-  };
-  // TODO: Check the nr_reclaimed is less than nr_to_evict
-  sc->nr_reclaimed += nr_reclaimed;
-  sc->nr_scanned += nr_reclaimed;
-  if (reclaim_pct > threshold_pct)
-  {
-    pr_info_ratelimited("cache_ext reclaim OK: nr_to_evict=%lu reclaimed=%lu pct=%llu => skip kernel scan\n",
-                        nr_to_evict, nr_reclaimed, reclaim_pct);
-    blk_finish_plug(&plug);
-    return;
-  }
-  else
-  {
-    pr_info_ratelimited("cache_ext reclaim SHORT: nr_to_evict=%lu reclaimed=%lu pct=%llu => kernel fallback scan\n",
-                        nr_to_evict, nr_reclaimed, reclaim_pct);
+    /*
+     * cache_ext selects victims from its policy list rather than scanning
+     * the kernel inactive-file LRU.  Limit policy work to the reclaim goal,
+     * but leave the kernel scan budget intact for a bounded fallback.
+     */
+    nr_to_reclaim = remaining_to_reclaim;
+    nr_reclaimed += cache_ext_reclaimed;
+
+    if (!proportional_reclaim && nr_reclaimed >= nr_to_reclaim)
+    {
+      pr_info_ratelimited("cache_ext reclaim OK: scan_budget=%lu target=%lu reclaimed=%lu => skip kernel scan\n",
+                          file_scan_budget, cache_ext_target,
+                          cache_ext_reclaimed);
+      sc->nr_reclaimed += nr_reclaimed;
+      blk_finish_plug(&plug);
+      return;
+    }
+
+    pr_info_ratelimited("cache_ext reclaim SHORT: scan_budget=%lu target=%lu reclaimed=%lu remaining=%lu => kernel fallback scan\n",
+                        file_scan_budget, cache_ext_target,
+                        cache_ext_reclaimed,
+                        nr_to_reclaim - min(nr_reclaimed,
+                                            nr_to_reclaim));
+    atomic64_inc(&lruvec_memcg(lruvec)->
+                 cache_ext_reclaim_stats[CACHE_EXT_RECLAIM_fallback_calls]);
+    atomic64_add(file_scan_budget, &lruvec_memcg(lruvec)->
+                 cache_ext_reclaim_stats[CACHE_EXT_RECLAIM_fallback_scan_pages]);
   }
   /***********************************************************************/
 

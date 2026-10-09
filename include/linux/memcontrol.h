@@ -376,6 +376,11 @@ struct mem_cgroup {
 
 	bool cache_ext_valid;
 	atomic64_t cache_ext_reclaim_stats[CACHE_EXT_RECLAIM_NR_STATS];
+	/* Lifecycle diagnostic, separate from per-reclaim stack/batch counters.
+	 * Counts successful common-path migrations with a non-NULL source node
+	 * pointer, not validated ownership, unique folios or reclaimed pages.
+	 */
+	atomic64_t cache_ext_migration_success_node_present_folios;
 
 	struct mem_cgroup_per_node *nodeinfo[];
 };

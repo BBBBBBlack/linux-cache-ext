@@ -5525,6 +5525,7 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 		return ERR_PTR(error);
 	for (i = 0; i < CACHE_EXT_RECLAIM_NR_STATS; i++)
 		atomic64_set(&memcg->cache_ext_reclaim_stats[i], 0);
+	atomic64_set(&memcg->cache_ext_migration_success_node_present_folios, 0);
 
 	memcg->id.id = idr_alloc(&mem_cgroup_idr, NULL,
 				 1, MEM_CGROUP_ID_MAX + 1, GFP_KERNEL);
@@ -6872,6 +6873,10 @@ static int cache_ext_reclaim_stat_show(struct seq_file *m, void *v)
 	for (i = 0; i < CACHE_EXT_RECLAIM_NR_STATS; i++)
 		seq_printf(m, "%s %llu\n", names[i],
 			   (unsigned long long)atomic64_read(&memcg->cache_ext_reclaim_stats[i]));
+	/* Same diagnostics file, but not a reclaim result or part of its batch. */
+	seq_printf(m, "migration_success_node_present_folios %llu\n",
+		   (unsigned long long)atomic64_read(
+			   &memcg->cache_ext_migration_success_node_present_folios));
 	return 0;
 }
 

@@ -9262,7 +9262,7 @@ static int set_cache_ext_list_iterate_callback_state(
 	__mark_reg_not_init(env, &callee->regs[BPF_REG_5]);
 
 	callee->in_callback_fn = true;
-	callee->callback_ret_range = tnum_range(0, 2);
+	callee->callback_ret_range = tnum_range(0, 3);
 	return 0;
 }
 

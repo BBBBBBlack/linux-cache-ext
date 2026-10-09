@@ -50,6 +50,7 @@
 #include <linux/random.h>
 #include <linux/sched/sysctl.h>
 #include <linux/memory-tiers.h>
+#include <linux/memcontrol.h>
 
 #include <asm/tlbflush.h>
 
@@ -993,6 +994,19 @@ static int move_to_new_folio(struct folio *dst, struct folio *src,
 	 * src is freed; but stats require that PageAnon be left as PageAnon.
 	 */
 	if (rc == MIGRATEPAGE_SUCCESS) {
+#ifdef CONFIG_MEMCG
+		/* Diagnostic only: source is still locked/alive here. Do not touch
+		 * the node or alter migration/list membership. A retained pointer
+		 * may already be stale; count presence, not validated ownership.
+		 */
+		if (READ_ONCE(src->cache_ext_node)) {
+			struct mem_cgroup *memcg = folio_memcg(src);
+
+			if (memcg && memcg->cache_ext_valid)
+				atomic64_inc(
+					&memcg->cache_ext_migration_success_node_present_folios);
+		}
+#endif
 		if (__PageMovable(&src->page)) {
 			VM_BUG_ON_FOLIO(!folio_test_isolated(src), src);
 

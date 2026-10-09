@@ -825,6 +825,8 @@ void BPF_STRUCT_OPS(mglru_evict_folios, struct cache_ext_eviction_ctx *eviction_
 		.continue_mode = CACHE_EXT_ITERATE_TAIL,
 		.evict_list = CACHE_EXT_ITERATE_SELF,
 		.evict_mode = CACHE_EXT_ITERATE_TAIL,
+		.deferred_list = CACHE_EXT_ITERATE_SELF,
+		.deferred_mode = CACHE_EXT_ITERATE_TAIL,
 	};
 
 
@@ -847,6 +849,8 @@ void BPF_STRUCT_OPS(mglru_evict_folios, struct cache_ext_eviction_ctx *eviction_
 			.continue_mode = CACHE_EXT_ITERATE_TAIL,
 			.evict_list = CACHE_EXT_ITERATE_SELF,
 			.evict_mode = CACHE_EXT_ITERATE_TAIL,
+			.deferred_list = CACHE_EXT_ITERATE_SELF,
+			.deferred_mode = CACHE_EXT_ITERATE_TAIL,
 		};
 		int ret = bpf_cache_ext_list_iterate_extended(
 			memcg, oldest_gen_list, mglru_iter_fn, &opts, eviction_ctx);

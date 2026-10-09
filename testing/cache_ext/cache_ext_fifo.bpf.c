@@ -34,7 +34,7 @@ static int bpf_fifo_evict_cb(int idx, struct cache_ext_list_node *a)
 	if (!folio_test_uptodate(a->folio) || !folio_test_lru(a->folio))
 		return CACHE_EXT_CONTINUE_ITER;
 
-	if (folio_test_dirty(a->folio) || folio_test_writeback(a->folio))
+	if (folio_test_writeback(a->folio))
 		return CACHE_EXT_CONTINUE_ITER;
 
 	return CACHE_EXT_EVICT_NODE;
@@ -43,7 +43,17 @@ static int bpf_fifo_evict_cb(int idx, struct cache_ext_list_node *a)
 void BPF_STRUCT_OPS(fifo_evict_folios, struct cache_ext_eviction_ctx *eviction_ctx,
 		    struct mem_cgroup *memcg)
 {
-	if (bpf_cache_ext_list_iterate(memcg, main_list, bpf_fifo_evict_cb, eviction_ctx) < 0) {
+	struct cache_ext_iterate_opts opts = {
+		.continue_list = CACHE_EXT_ITERATE_SELF,
+		.continue_mode = CACHE_EXT_ITERATE_SKIP,
+		.evict_list = CACHE_EXT_ITERATE_SELF,
+		.evict_mode = CACHE_EXT_ITERATE_TAIL,
+		.deferred_list = CACHE_EXT_ITERATE_SELF,
+		.deferred_mode = CACHE_EXT_ITERATE_TAIL,
+	};
+
+	if (bpf_cache_ext_list_iterate_extended(memcg, main_list, bpf_fifo_evict_cb,
+						&opts, eviction_ctx) < 0) {
 		bpf_printk("cache_ext: evict: Failed to iterate main_list\n");
 		return;
 	}

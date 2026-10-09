@@ -121,6 +121,66 @@ cache_ext_folio_to_node_fast(struct folio* folio)
   return node;
 }
 
+static inline bool
+cache_ext_list_node_consume_reclaim_deferred(struct mem_cgroup* memcg,
+                                             struct cache_ext_list_node* node)
+{
+  struct folio* folio;
+  bool still_deferred;
+  bool has_reclaim_deferred = cache_ext_list_node_reclaim_deferred(node);
+  bool has_recent_deferred = cache_ext_list_node_recent_deferred(node);
+  unsigned long nr_pages;
+
+  if (!has_reclaim_deferred && !has_recent_deferred)
+    return false;
+
+  if (has_reclaim_deferred)
+  {
+    cache_ext_list_node_clear_reclaim_deferred(node);
+    cache_ext_list_node_clear_recent_deferred(node);
+  }
+  else
+  {
+    cache_ext_list_node_clear_recent_deferred(node);
+  }
+
+  folio = READ_ONCE(node->folio);
+  if (!folio || cache_ext_list_node_removed(node) ||
+      cache_ext_list_node_freed(node))
+    return false;
+
+  nr_pages = folio_nr_pages(folio);
+
+  if (has_reclaim_deferred)
+  {
+    still_deferred = folio_test_dirty(folio) || folio_test_writeback(folio);
+
+    if (still_deferred)
+    {
+      atomic64_add(nr_pages, &memcg->cache_ext_reclaim_stats[
+                                 CACHE_EXT_RECLAIM_deferred_still_dirty_pages]);
+      cache_ext_list_node_mark_recent_deferred(node);
+    }
+    else
+    {
+      atomic64_add(nr_pages, &memcg->cache_ext_reclaim_stats[
+                                 CACHE_EXT_RECLAIM_deferred_clean_pages]);
+    }
+
+    return still_deferred;
+  }
+
+  if (has_recent_deferred &&
+      (folio_test_dirty(folio) || folio_test_writeback(folio)))
+  {
+    atomic64_add(nr_pages, &memcg->cache_ext_reclaim_stats[
+                               CACHE_EXT_RECLAIM_deferred_revisit_still_dirty_pages]);
+    return true;
+  }
+
+  return false;
+}
+
 int __cache_ext_list_add_impl(struct cache_ext_list* list, struct folio* folio,
                               bool tail)
 {
@@ -128,21 +188,20 @@ int __cache_ext_list_add_impl(struct cache_ext_list* list, struct folio* folio,
   struct cache_ext_list_node* node;
 
   if (!list || !folio)
-    return -1;
+    return -EINVAL;
 
   reg_flags = cache_ext_ds_registry_write_lock(folio);
-
   node = cache_ext_folio_to_node_fast(folio);
   if (!node)
   {
     cache_ext_ds_registry_write_unlock(folio, reg_flags);
-    return -1;
+    return -ESTALE;
   }
 
   if (!list_empty(&node->node))
   {
     cache_ext_ds_registry_write_unlock(folio, reg_flags);
-    return -1;
+    return -EEXIST;
   }
 
   if (tail)
@@ -150,6 +209,7 @@ int __cache_ext_list_add_impl(struct cache_ext_list* list, struct folio* folio,
   else
     list_add(&node->node, &list->head);
 
+  atomic_or(CACHE_EXT_NODE_EVER_ADMITTED, &node->state);
   cache_ext_ds_registry_write_unlock(folio, reg_flags);
   return 0;
 }
@@ -174,7 +234,6 @@ int cache_ext_list_move(struct cache_ext_list* list, struct folio* folio,
     return -1;
 
   reg_flags = cache_ext_ds_registry_write_lock(folio);
-
   node = cache_ext_folio_to_node_fast(folio);
   if (!node)
   {
@@ -259,6 +318,7 @@ enum cache_ext_iter_callback_ret
   CACHE_EXT_CONTINUE_ITER = 0,
   CACHE_EXT_STOP_ITER = 1,
   CACHE_EXT_EVICT_NODE = 2,
+  CACHE_EXT_RETRY_LATER = 3,
 };
 
 enum cache_ext_iter_ret
@@ -307,6 +367,10 @@ int cache_ext_list_iterate(struct mem_cgroup* memcg,
     iter++;
 
     if (cb_ret == CACHE_EXT_CONTINUE_ITER)
+    {
+      continue;
+    }
+    else if (cb_ret == CACHE_EXT_RETRY_LATER)
     {
       continue;
     }
@@ -369,9 +433,19 @@ struct cache_ext_iterate_opts
   u64 evict_list;
   u64 evict_mode;
 
+  // Options for CACHE_EXT_RETRY_LATER nodes
+  u64 retry_list;
+  u64 retry_mode;
+
+  // Options for deferred dirty/writeback nodes
+  u64 deferred_list;
+  u64 deferred_mode;
+
   // Output
   u64 nr_folios_continue;
   u64 nr_folios_evict;
+  u64 nr_folios_retry;
+  u64 nr_folios_deferred;
 };
 
 static bool cache_ext_validate_iterate_opts(struct cache_ext_iterate_opts* opts)
@@ -382,12 +456,26 @@ static bool cache_ext_validate_iterate_opts(struct cache_ext_iterate_opts* opts)
   if (opts->evict_mode >= CACHE_EXT_ITERATE_MAX)
     return false;
 
+  if (opts->retry_mode >= CACHE_EXT_ITERATE_MAX)
+    return false;
+
+  if (opts->deferred_mode >= CACHE_EXT_ITERATE_MAX)
+    return false;
+
   if (opts->continue_list != CACHE_EXT_ITERATE_SELF &&
       opts->continue_mode == CACHE_EXT_ITERATE_SKIP)
     return false;
 
   if (opts->evict_list != CACHE_EXT_ITERATE_SELF &&
       opts->evict_mode == CACHE_EXT_ITERATE_SKIP)
+    return false;
+
+  if (opts->retry_list != CACHE_EXT_ITERATE_SELF &&
+      opts->retry_mode == CACHE_EXT_ITERATE_SKIP)
+    return false;
+
+  if (opts->deferred_list != CACHE_EXT_ITERATE_SELF &&
+      opts->deferred_mode == CACHE_EXT_ITERATE_SKIP)
     return false;
   return true;
 }
@@ -401,7 +489,7 @@ int cache_ext_list_iterate_extended(struct mem_cgroup* memcg,
   uint64_t max_iter = 4096;
   struct cache_ext_list_node *node, *node2, *stop_node;
   bpf_callback_t bpf_iter_fn = (bpf_callback_t)iter_fn;
-  struct cache_ext_list *continue_list, *evict_list;
+  struct cache_ext_list *continue_list, *evict_list, *retry_list, *deferred_list;
 
   if (!cache_ext_validate_iterate_opts(opts))
     return -1;
@@ -434,8 +522,33 @@ int cache_ext_list_iterate_extended(struct mem_cgroup* memcg,
     evict_list = list;
   }
 
+  if (opts->retry_list != CACHE_EXT_ITERATE_SELF)
+  {
+    retry_list = cache_ext_ds_registry_get(registry, opts->retry_list);
+    if (!retry_list)
+      return -1;
+  }
+  else
+  {
+    retry_list = list;
+  }
+
+  if (opts->deferred_list != CACHE_EXT_ITERATE_SELF)
+  {
+    deferred_list = cache_ext_ds_registry_get(registry, opts->deferred_list);
+    if (!deferred_list)
+      return -1;
+  }
+  else
+  {
+    deferred_list = list;
+  }
+
   unsigned long flags;
-  if (opts->continue_mode == CACHE_EXT_ITERATE_SKIP && opts->evict_mode == CACHE_EXT_ITERATE_SKIP)
+  if (opts->continue_mode == CACHE_EXT_ITERATE_SKIP &&
+      opts->evict_mode == CACHE_EXT_ITERATE_SKIP &&
+      opts->retry_mode == CACHE_EXT_ITERATE_SKIP &&
+      opts->deferred_mode == CACHE_EXT_ITERATE_SKIP)
     read_lock_irqsave(&registry->lock, flags);
   else
     write_lock_irqsave(&registry->lock, flags);
@@ -463,6 +576,20 @@ int cache_ext_list_iterate_extended(struct mem_cgroup* memcg,
       break;
     }
 
+    if (cache_ext_list_node_consume_reclaim_deferred(memcg, node))
+    {
+      if (opts->deferred_mode == CACHE_EXT_ITERATE_HEAD)
+        list_move(&node->node, &deferred_list->head);
+      else if (opts->deferred_mode == CACHE_EXT_ITERATE_TAIL)
+        list_move_tail(&node->node, &deferred_list->head);
+
+      opts->nr_folios_deferred++;
+      iter++;
+      if (reached_stop)
+        break;
+      continue;
+    }
+
     // TODO: Ensure that we don't let the callback use any of the list
     // helpers, or we will have a deadlock.
     cb_ret = bpf_iter_fn((u64)iter, (u64)node, (u64)0, (u64)0, (u64)0);
@@ -476,6 +603,19 @@ int cache_ext_list_iterate_extended(struct mem_cgroup* memcg,
         list_move_tail(&node->node, &continue_list->head);
 
       opts->nr_folios_continue++;
+
+      if (reached_stop)
+        break;
+      continue;
+    }
+    else if (cb_ret == CACHE_EXT_RETRY_LATER)
+    {
+      if (opts->retry_mode == CACHE_EXT_ITERATE_HEAD)
+        list_move(&node->node, &retry_list->head);
+      else if (opts->retry_mode == CACHE_EXT_ITERATE_TAIL)
+        list_move_tail(&node->node, &retry_list->head);
+
+      opts->nr_folios_retry++;
 
       if (reached_stop)
         break;
@@ -522,7 +662,10 @@ int cache_ext_list_iterate_extended(struct mem_cgroup* memcg,
   }
 
 unlock:
-  if (opts->continue_mode == CACHE_EXT_ITERATE_SKIP && opts->evict_mode == CACHE_EXT_ITERATE_SKIP)
+  if (opts->continue_mode == CACHE_EXT_ITERATE_SKIP &&
+      opts->evict_mode == CACHE_EXT_ITERATE_SKIP &&
+      opts->retry_mode == CACHE_EXT_ITERATE_SKIP &&
+      opts->deferred_mode == CACHE_EXT_ITERATE_SKIP)
     read_unlock_irqrestore(&registry->lock, flags);
   else
     write_unlock_irqrestore(&registry->lock, flags);
@@ -549,27 +692,39 @@ int cache_ext_list_free(struct cache_ext_list* list)
 
 __bpf_kfunc int bpf_cache_ext_list_add(u64 list, struct folio* folio)
 {
-  struct cache_ext_list* list_ptr = cache_ext_ds_registry_get(
+  struct cache_ext_list* list_ptr;
+
+  if (!folio)
+    return -EINVAL;
+  list_ptr = cache_ext_ds_registry_get(
       cache_ext_ds_registry_from_folio(folio), list);
   if (!list_ptr)
-    return -1;
+    return -ENOENT;
 
   return cache_ext_list_add(list_ptr, folio);
 };
 
 __bpf_kfunc int bpf_cache_ext_list_add_tail(u64 list, struct folio* folio)
 {
-  struct cache_ext_list* list_ptr = cache_ext_ds_registry_get(
+  struct cache_ext_list* list_ptr;
+
+  if (!folio)
+    return -EINVAL;
+  list_ptr = cache_ext_ds_registry_get(
       cache_ext_ds_registry_from_folio(folio), list);
   if (!list_ptr)
-    return -1;
+    return -ENOENT;
 
   return cache_ext_list_add_tail(list_ptr, folio);
 };
 
 __bpf_kfunc int bpf_cache_ext_list_move(u64 list, struct folio* folio, bool tail)
 {
-  struct cache_ext_list* list_ptr = cache_ext_ds_registry_get(
+  struct cache_ext_list* list_ptr;
+
+  if (!folio)
+    return -1;
+  list_ptr = cache_ext_ds_registry_get(
       cache_ext_ds_registry_from_folio(folio), list);
   if (!list_ptr)
     return -1;
@@ -636,6 +791,15 @@ __bpf_kfunc int bpf_cache_ext_list_iterate_extended(
 #define MAX_SAMPLE_FOLIOS 2048
 DEFINE_PER_CPU(struct cache_ext_list_node*, sample_folios[MAX_SAMPLE_FOLIOS]);
 DEFINE_PER_CPU(u8, sample_folios_selected[MAX_SAMPLE_FOLIOS]);
+DEFINE_PER_CPU(u8, sample_folios_state[MAX_SAMPLE_FOLIOS]);
+
+enum cache_ext_sample_node_state
+{
+  CACHE_EXT_SAMPLE_NODE_SAMPLED = 0,
+  CACHE_EXT_SAMPLE_NODE_SELECTED,
+  CACHE_EXT_SAMPLE_NODE_DEFERRED,
+  CACHE_EXT_SAMPLE_NODE_UNSELECTABLE,
+};
 
 void __putback_list_nodes(struct cache_ext_list* list, struct cache_ext_list_node** sample_folios_arr, int size)
 {
@@ -664,6 +828,78 @@ void __putback_list_nodes(struct cache_ext_list* list, struct cache_ext_list_nod
   }
 }
 
+static struct cache_ext_list*
+cache_ext_sample_target_list(struct cache_ext_list* src,
+                             struct cache_ext_list* sampled,
+                             struct cache_ext_list* evict,
+                             struct cache_ext_list* deferred,
+                             u8 state)
+{
+  if (state == CACHE_EXT_SAMPLE_NODE_SELECTED)
+    return evict ?: src;
+  if (state == CACHE_EXT_SAMPLE_NODE_DEFERRED)
+    return deferred ?: src;
+  return sampled ?: src;
+}
+
+static u64 cache_ext_sample_target_mode(struct cache_ext_sample_opts* opts,
+                                        u8 state)
+{
+  if (state == CACHE_EXT_SAMPLE_NODE_SELECTED)
+    return opts->evict_mode;
+  if (state == CACHE_EXT_SAMPLE_NODE_DEFERRED)
+    return opts->deferred_mode;
+  return opts->sampled_mode;
+}
+
+static void __putback_sample_nodes_extended(
+    struct cache_ext_list* src_list,
+    struct cache_ext_list* sampled_list,
+    struct cache_ext_list* evict_list,
+    struct cache_ext_list* deferred_list,
+    struct cache_ext_list_node** sample_folios_arr,
+    u8* sample_state_arr,
+    int size,
+    struct cache_ext_sample_opts* opts)
+{
+  for (int i = 0; i < size; i++)
+  {
+    struct cache_ext_list_node* node = sample_folios_arr[i];
+    struct cache_ext_list* target_list;
+    u64 mode;
+
+    if (!node)
+      continue;
+
+    if (cache_ext_list_node_removed(node))
+      continue;
+
+    // HACK: Check if either left or right pointer is poisoned
+    if (node->node.next == LIST_POISON1 ||
+        node->node.next == LIST_POISON2 ||
+        node->node.prev == LIST_POISON1 ||
+        node->node.prev == LIST_POISON2)
+    {
+      pr_warn("cache_ext: folio removed from page cache while isolated by sampling\n");
+      cache_ext_list_node_mark_removed(node);
+      continue;
+    }
+
+    if (!list_empty(&node->node))
+      continue;
+
+    target_list = cache_ext_sample_target_list(src_list, sampled_list,
+                                               evict_list, deferred_list,
+                                               sample_state_arr[i]);
+    mode = cache_ext_sample_target_mode(opts, sample_state_arr[i]);
+
+    if (mode == CACHE_EXT_ITERATE_HEAD)
+      list_add(&node->node, &target_list->head);
+    else
+      list_add_tail(&node->node, &target_list->head);
+  }
+}
+
 void __unpin_sample_nodes(struct cache_ext_list_node** sample_folios_arr,
                           u8* selected_arr, int size)
 {
@@ -684,13 +920,48 @@ void __unpin_sample_nodes(struct cache_ext_list_node** sample_folios_arr,
   }
 }
 
-int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
-                                s64(score_fn)(struct cache_ext_list_node* a),
-                                struct sampling_options* opts,
-                                struct cache_ext_eviction_ctx* ctx)
+static bool cache_ext_validate_sample_opts(struct cache_ext_sample_opts* opts)
+{
+  if (!opts || !opts->sample_size)
+    return false;
+
+  if (opts->sampled_mode >= CACHE_EXT_ITERATE_MAX)
+    return false;
+
+  if (opts->evict_mode >= CACHE_EXT_ITERATE_MAX)
+    return false;
+
+  if (opts->deferred_mode >= CACHE_EXT_ITERATE_MAX)
+    return false;
+
+  if (opts->sampled_list != CACHE_EXT_ITERATE_SELF &&
+      opts->sampled_mode == CACHE_EXT_ITERATE_SKIP)
+    return false;
+
+  if (opts->evict_list != CACHE_EXT_ITERATE_SELF &&
+      opts->evict_mode == CACHE_EXT_ITERATE_SKIP)
+    return false;
+
+  if (opts->deferred_list != CACHE_EXT_ITERATE_SELF &&
+      opts->deferred_mode == CACHE_EXT_ITERATE_SKIP)
+    return false;
+
+  return true;
+}
+
+int __bpf_cache_ext_list_sample_extended(struct mem_cgroup* memcg, u64 list,
+                                         s64(score_fn)(struct cache_ext_list_node* a),
+                                         struct cache_ext_sample_opts* opts,
+                                         struct cache_ext_eviction_ctx* ctx)
 {
   // Select the first select_size elements with the lowest score out of
   // sample_size elements in the given list.
+  if (!ctx || !cache_ext_validate_sample_opts(opts))
+  {
+    pr_err("cache_ext: invalid sample ctx or opts\n");
+    return -1;
+  }
+
   int sample_size = opts->sample_size;
   int num_folios_to_sample = ctx->request_nr_folios_to_evict * sample_size;
   if (num_folios_to_sample > MAX_SAMPLE_FOLIOS)
@@ -701,15 +972,37 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
   int sample_folios_size = 0;
   struct cache_ext_list_node** sample_folios_arr = this_cpu_ptr(sample_folios);
   u8* selected_arr = this_cpu_ptr(sample_folios_selected);
+  u8* sample_state_arr = this_cpu_ptr(sample_folios_state);
 
   unsigned long flags;
   struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_memcg(memcg);
   struct cache_ext_list* list_ptr = cache_ext_ds_registry_get(registry, list);
+  struct cache_ext_list *sampled_list = list_ptr, *evict_list = list_ptr,
+                        *deferred_list = list_ptr;
   if (!list_ptr)
   {
     pr_err("cache_ext: list is NULL\n");
     return -1;
   }
+  if (opts->sampled_list != CACHE_EXT_ITERATE_SELF)
+  {
+    sampled_list = cache_ext_ds_registry_get(registry, opts->sampled_list);
+    if (!sampled_list)
+      return -1;
+  }
+  if (opts->evict_list != CACHE_EXT_ITERATE_SELF)
+  {
+    evict_list = cache_ext_ds_registry_get(registry, opts->evict_list);
+    if (!evict_list)
+      return -1;
+  }
+  if (opts->deferred_list != CACHE_EXT_ITERATE_SELF)
+  {
+    deferred_list = cache_ext_ds_registry_get(registry, opts->deferred_list);
+    if (!deferred_list)
+      return -1;
+  }
+
   write_lock_irqsave(&registry->lock, flags);
 
   // Optimization: Snip the front of the list and select the pages without
@@ -735,6 +1028,7 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
     }
     sample_folios_arr[sample_folios_size] = node;
     selected_arr[sample_folios_size] = 0;
+    sample_state_arr[sample_folios_size] = CACHE_EXT_SAMPLE_NODE_SAMPLED;
     sample_folios_size++;
     // if (node->node.next == NULL || node->node.prev == NULL) {
     // 	pr_warn("cache_ext: node->node.next or node->node.prev is NULL\n");
@@ -754,7 +1048,29 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
   {
     int min_idx = sample_folios_idx;
     struct cache_ext_list_node* min_node = sample_folios_arr[sample_folios_idx];
-    s64 min_score = cache_ext_list_node_removed(min_node) ? S64_MAX : score_fn(min_node);
+    s64 min_score;
+
+    if (cache_ext_list_node_removed(min_node))
+    {
+      min_score = S64_MAX;
+      sample_state_arr[min_idx] = CACHE_EXT_SAMPLE_NODE_UNSELECTABLE;
+      opts->nr_folios_unselectable++;
+    }
+    else if (cache_ext_list_node_consume_reclaim_deferred(memcg, min_node))
+    {
+      min_score = S64_MAX;
+      sample_state_arr[min_idx] = CACHE_EXT_SAMPLE_NODE_DEFERRED;
+      opts->nr_folios_deferred++;
+    }
+    else
+    {
+      min_score = score_fn(min_node);
+      if (min_score == S64_MAX)
+      {
+        sample_state_arr[min_idx] = CACHE_EXT_SAMPLE_NODE_UNSELECTABLE;
+        opts->nr_folios_unselectable++;
+      }
+    }
 
     sample_folios_idx++;
 
@@ -766,7 +1082,31 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
     for (int j = 1; j < sample_size; j++)
     {
       struct cache_ext_list_node* curr_node = sample_folios_arr[sample_folios_idx];
-      s64 curr_score = cache_ext_list_node_removed(curr_node) ? S64_MAX : score_fn(curr_node);
+      s64 curr_score;
+      int curr_idx = sample_folios_idx;
+
+      if (cache_ext_list_node_removed(curr_node))
+      {
+        curr_score = S64_MAX;
+        sample_state_arr[curr_idx] = CACHE_EXT_SAMPLE_NODE_UNSELECTABLE;
+        opts->nr_folios_unselectable++;
+      }
+      else if (cache_ext_list_node_consume_reclaim_deferred(memcg, curr_node))
+      {
+        curr_score = S64_MAX;
+        sample_state_arr[curr_idx] = CACHE_EXT_SAMPLE_NODE_DEFERRED;
+        opts->nr_folios_deferred++;
+      }
+      else
+      {
+        curr_score = score_fn(curr_node);
+        if (curr_score == S64_MAX)
+        {
+          sample_state_arr[curr_idx] = CACHE_EXT_SAMPLE_NODE_UNSELECTABLE;
+          opts->nr_folios_unselectable++;
+        }
+      }
+
       sample_folios_idx++;
       if (curr_score < min_score)
       {
@@ -785,20 +1125,50 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
       ctx->scores[ctx->nr_folios_to_evict] = min_score;
       ctx->nodes_to_evict[ctx->nr_folios_to_evict] = min_node;
       selected_arr[min_idx] = 1;
+      sample_state_arr[min_idx] = CACHE_EXT_SAMPLE_NODE_SELECTED;
+      opts->nr_folios_evicted++;
       ctx->nr_folios_to_evict++;
 
       if (cache_ext_evict_ctx_full(ctx))
         break;
     }
   }
+  opts->nr_folios_sampled = sample_folios_size;
 
   // 2. Put everything to the back of the list.
   write_lock_irqsave(&registry->lock, flags);
-  __putback_list_nodes(list_ptr, sample_folios_arr, sample_folios_size);
+  __putback_sample_nodes_extended(list_ptr, sampled_list, evict_list,
+                                  deferred_list, sample_folios_arr,
+                                  sample_state_arr, sample_folios_size, opts);
   write_unlock_irqrestore(&registry->lock, flags);
   __unpin_sample_nodes(sample_folios_arr, selected_arr, sample_folios_size);
 
   return 0;
+}
+
+int __bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
+                                s64(score_fn)(struct cache_ext_list_node* a),
+                                struct sampling_options* opts,
+                                struct cache_ext_eviction_ctx* ctx)
+{
+  if (!opts || !ctx)
+  {
+    pr_err("cache_ext: invalid sample ctx or opts\n");
+    return -1;
+  }
+
+  struct cache_ext_sample_opts ext_opts = {
+      .sample_size = opts->sample_size,
+      .sampled_list = CACHE_EXT_ITERATE_SELF,
+      .sampled_mode = CACHE_EXT_ITERATE_TAIL,
+      .evict_list = CACHE_EXT_ITERATE_SELF,
+      .evict_mode = CACHE_EXT_ITERATE_TAIL,
+      .deferred_list = CACHE_EXT_ITERATE_SELF,
+      .deferred_mode = CACHE_EXT_ITERATE_TAIL,
+  };
+
+  return __bpf_cache_ext_list_sample_extended(memcg, list, score_fn,
+                                             &ext_opts, ctx);
 }
 
 __bpf_kfunc int
@@ -814,6 +1184,19 @@ bpf_cache_ext_list_sample(struct mem_cgroup* memcg, u64 list,
   BUG();
 }
 
+__bpf_kfunc int
+bpf_cache_ext_list_sample_extended(struct mem_cgroup* memcg, u64 list,
+                                   s64(score_fn)(struct cache_ext_list_node* a),
+                                   struct cache_ext_sample_opts* opts,
+                                   struct cache_ext_eviction_ctx* ctx)
+{
+  scoped_guard(preempt)
+  {
+    return __bpf_cache_ext_list_sample_extended(memcg, list, score_fn, opts, ctx);
+  }
+  BUG();
+}
+
 enum cache_ext_list_ops_type
 {
   KF_bpf_cache_ext_list_add,
@@ -825,6 +1208,7 @@ enum cache_ext_list_ops_type
   KF_bpf_cache_ext_list_sample,
   KF_bpf_cache_ext_list_move,
   KF_bpf_cache_ext_list_iterate_extended,
+  KF_bpf_cache_ext_list_sample_extended,
 };
 
 BTF_SET8_START(cache_ext_list_ops)
@@ -837,6 +1221,7 @@ BTF_ID_FLAGS(func, bpf_cache_ext_list_iterate)
 BTF_ID_FLAGS(func, bpf_cache_ext_list_sample)
 BTF_ID_FLAGS(func, bpf_cache_ext_list_move)
 BTF_ID_FLAGS(func, bpf_cache_ext_list_iterate_extended)
+BTF_ID_FLAGS(func, bpf_cache_ext_list_sample_extended)
 BTF_SET8_END(cache_ext_list_ops)
 
 BTF_ID_LIST(cache_ext_list_ops_list)
@@ -849,6 +1234,7 @@ BTF_ID(func, bpf_cache_ext_list_iterate)
 BTF_ID(func, bpf_cache_ext_list_sample)
 BTF_ID(func, bpf_cache_ext_list_move)
 BTF_ID(func, bpf_cache_ext_list_iterate_extended)
+BTF_ID(func, bpf_cache_ext_list_sample_extended)
 
 noinline bool cache_ext_is_callback_calling_kfunc_iterate(u32 btf_id)
 {
@@ -859,7 +1245,8 @@ noinline bool cache_ext_is_callback_calling_kfunc_iterate(u32 btf_id)
 
 noinline bool cache_ext_is_callback_calling_kfunc_sample(u32 btf_id)
 {
-  return (btf_id == cache_ext_list_ops_list[KF_bpf_cache_ext_list_sample]);
+  return (btf_id == cache_ext_list_ops_list[KF_bpf_cache_ext_list_sample] ||
+          btf_id == cache_ext_list_ops_list[KF_bpf_cache_ext_list_sample_extended]);
 }
 
 static const struct btf_kfunc_id_set cache_ext_kfunc_set_list_ops = {
@@ -916,19 +1303,18 @@ struct cache_ext_list*
 cache_ext_ds_registry_get(struct cache_ext_ds_registry* registry, u64 list_ptr)
 {
   unsigned long flags;
-  struct cache_ext_list* cur_list;
-  u64 key = list_ptr;
+  struct cache_ext_list* list;
+
   read_lock_irqsave(&registry->lock, flags);
-  hash_for_each_possible(registry->ds_hash, cur_list, h_node, key)
+  hash_for_each_possible(registry->ds_hash, list, h_node, list_ptr)
   {
-    if (key == (u64)cur_list)
+    if (list_ptr == (u64)list)
     {
       read_unlock_irqrestore(&registry->lock, flags);
-      return cur_list;
+      return list;
     }
   }
   read_unlock_irqrestore(&registry->lock, flags);
-
   return NULL;
 }
 
@@ -1122,6 +1508,14 @@ __bpf_kfunc struct mem_cgroup* bpf_cache_ext_folio_to_memcg(struct folio* folio)
   return folio_memcg(folio);
 }
 
+/* Load-time capability dependency: reject diagnostic policies on old kernels
+ * rather than silently treating every node as never admitted.
+ */
+__bpf_kfunc u32 bpf_cache_ext_admission_tracking_mask(void)
+{
+  return CACHE_EXT_NODE_EVER_ADMITTED;
+}
+
 __bpf_kfunc struct cache_ext_list_node* bpf_cache_ext_folio_to_node(struct folio* folio)
 {
   if (!folio)
@@ -1190,6 +1584,7 @@ __bpf_kfunc u64 bpf_cache_ext_node_add_metadata(
 }
 
 BTF_SET8_START(cache_ext_handle_ops)
+BTF_ID_FLAGS(func, bpf_cache_ext_admission_tracking_mask)
 BTF_ID_FLAGS(func, bpf_cache_ext_folio_to_handle)
 BTF_ID_FLAGS(func, bpf_cache_ext_memcg_to_handle)
 BTF_ID_FLAGS(func, bpf_cache_ext_ctx_to_handle)
