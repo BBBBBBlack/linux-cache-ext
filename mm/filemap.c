@@ -219,13 +219,18 @@ static void filemap_unaccount_folio(struct address_space *mapping,
 void __filemap_remove_folio(struct folio *folio, void *shadow)
 {
 	struct address_space *mapping = folio->mapping;
-	/* cache_ext: folios_evicted hook (batch of 1) */
 	struct mem_cgroup *memcg = folio_memcg(folio);
-	struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
-	if (pcext_ops != NULL && pcext_ops->folios_evicted != NULL) {
-		struct cache_ext_evicted_ctx ctx = { .nr_folios = 1 };
-		ctx.folios[0] = folio;
-		pcext_ops->folios_evicted(&ctx);
+	/* cache_ext: folios_evicted hook (batch of 1) */
+	if (memcg && rcu_access_pointer(memcg->css.cgroup->bpf.cache_ext_ops)) {
+		int cache_ext_idx = srcu_read_lock(&cache_ext_srcu);
+		struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
+
+		if (pcext_ops && pcext_ops->folios_evicted) {
+			struct cache_ext_evicted_ctx ctx = { .nr_folios = 1 };
+			ctx.folios[0] = folio;
+			pcext_ops->folios_evicted(&ctx);
+		}
+		srcu_read_unlock(&cache_ext_srcu, cache_ext_idx);
 	}
 
 	if (memcg && memcg->cache_ext_valid)
@@ -331,12 +336,21 @@ void delete_from_page_cache_batch(struct address_space *mapping,
 				  struct folio_batch *fbatch)
 {
 	int i;
+	bool cache_ext_active = false;
 
 	if (!folio_batch_count(fbatch))
 		return;
+	for (i = 0; i < folio_batch_count(fbatch); i++) {
+		struct mem_cgroup *memcg = folio_memcg(fbatch->folios[i]);
+		if (memcg && rcu_access_pointer(memcg->css.cgroup->bpf.cache_ext_ops)) {
+			cache_ext_active = true;
+			break;
+		}
+	}
 
 	/* cache_ext: batch folios_evicted hook — one BPF call for the whole batch */
-	{
+	if (cache_ext_active) {
+		int cache_ext_idx = srcu_read_lock(&cache_ext_srcu);
 		struct cache_ext_evicted_ctx ctx = { .nr_folios = 0 };
 		struct cache_ext_ops *batch_ops = NULL;
 		bool ops_uniform = true;
@@ -362,6 +376,7 @@ void delete_from_page_cache_batch(struct address_space *mapping,
 				}
 			}
 		}
+		srcu_read_unlock(&cache_ext_srcu, cache_ext_idx);
 	}
 
 	spin_lock(&mapping->host->i_lock);
@@ -887,6 +902,7 @@ noinline int __filemap_add_folio(struct address_space *mapping,
 		struct folio *folio, pgoff_t index, gfp_t gfp, void **shadowp)
 {
 	XA_STATE(xas, &mapping->i_pages, index);
+	struct mem_cgroup *memcg;
 	int huge = folio_test_hugetlb(folio);
 	bool charged = false;
 	long nr = 1;
@@ -959,14 +975,19 @@ unlock:
 	if (xas_error(&xas))
 		goto error;
 
-	struct mem_cgroup *memcg = folio_memcg(folio);
-	/* cache_ext: Maintain the valid folios hashtable */
+	memcg = folio_memcg(folio);
+	/* cache_ext: Maintain the node binding. */
 	if (memcg && memcg->cache_ext_valid)
 		valid_folios_add(folio);
 	/* cache_ext: folio_added hook */
-	struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
-	if (pcext_ops != NULL && pcext_ops->folio_added != NULL)
-		pcext_ops->folio_added(folio);
+	if (memcg && rcu_access_pointer(memcg->css.cgroup->bpf.cache_ext_ops)) {
+		int cache_ext_idx = srcu_read_lock(&cache_ext_srcu);
+		struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
+
+		if (pcext_ops && pcext_ops->folio_added)
+			pcext_ops->folio_added(folio);
+		srcu_read_unlock(&cache_ext_srcu, cache_ext_idx);
+	}
 
 	trace_mm_filemap_add_to_page_cache(folio);
 	return 0;
@@ -2674,23 +2695,25 @@ retry:
 	filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
 	if (!folio_batch_count(fbatch)) {
 		struct mem_cgroup *memcg;
-		struct cache_ext_ops *cache_ext_ops;
-
-		/* Run cache_ext admission hook */
-		rcu_read_lock();
-
 		memcg = mem_cgroup_from_task(current);
-		cache_ext_ops = get_cache_ext_ops(memcg);
-		if (cache_ext_ops && cache_ext_ops->admit_folio) {
-			struct cache_ext_admission_ctx ctx = {
-				.ino = filp->f_inode->i_ino,
-				.offset = iocb->ki_pos,
-				.size = count,
-			};
-			ret = cache_ext_ops->admit_folio(&ctx);
-		}
+		if (memcg && rcu_access_pointer(memcg->css.cgroup->bpf.cache_ext_ops)) {
+			struct cache_ext_ops *cache_ext_ops;
+			int cache_ext_idx = srcu_read_lock(&cache_ext_srcu);
 
-		rcu_read_unlock();
+			/* Run cache_ext admission hook */
+			rcu_read_lock();
+			cache_ext_ops = get_cache_ext_ops(memcg);
+			if (cache_ext_ops && cache_ext_ops->admit_folio) {
+				struct cache_ext_admission_ctx ctx = {
+					.ino = filp->f_inode->i_ino,
+					.offset = iocb->ki_pos,
+					.size = count,
+				};
+				ret = cache_ext_ops->admit_folio(&ctx);
+			}
+			rcu_read_unlock();
+			srcu_read_unlock(&cache_ext_srcu, cache_ext_idx);
+		}
 
 		/* Admission hook decided not to add to page cache */
 		if (ret)

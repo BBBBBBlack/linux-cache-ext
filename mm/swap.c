@@ -460,11 +460,16 @@ void folio_mark_accessed(struct folio *folio)
 	/* cache_ext: folio_accessed hook */
 	struct mem_cgroup *memcg;
 	memcg = folio_memcg(folio);
-	struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
-	if (pcext_ops != NULL && pcext_ops->folio_accessed != NULL) {
-		rcu_read_lock();
-		pcext_ops->folio_accessed(folio);
-		rcu_read_unlock();
+	if (memcg && rcu_access_pointer(memcg->css.cgroup->bpf.cache_ext_ops)) {
+		int cache_ext_idx = srcu_read_lock(&cache_ext_srcu);
+		struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
+
+		if (pcext_ops && pcext_ops->folio_accessed) {
+			rcu_read_lock();
+			pcext_ops->folio_accessed(folio);
+			rcu_read_unlock();
+		}
+		srcu_read_unlock(&cache_ext_srcu, cache_ext_idx);
 	}
 
 	if (lru_gen_enabled()) {

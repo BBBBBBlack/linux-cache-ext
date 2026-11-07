@@ -91,6 +91,7 @@ void valid_folios_del(struct folio *folio);
 bool valid_folios_exists(struct valid_folios_set *valid_folios_set, struct folio *folio);
 bool valid_folios_exists_unlocked(struct valid_folios_set *valid_folios_set, struct folio *folio);
 struct valid_folios_set * lruvec_to_valid_folios_set(struct lruvec *lruvec);
+/* Hold cache_ext_srcu across lookup, callback, and use of policy resources. */
 struct cache_ext_ops *get_cache_ext_ops(struct mem_cgroup *memcg);
 struct valid_folio *valid_folios_lookup_unlocked(struct valid_folios_set *valid_folios_set, struct folio *folio);
 struct valid_folio *valid_folios_lookup(struct folio *folio);
@@ -376,11 +377,8 @@ struct mem_cgroup {
 
 	bool cache_ext_valid;
 	atomic64_t cache_ext_reclaim_stats[CACHE_EXT_RECLAIM_NR_STATS];
-	/* Lifecycle diagnostic, separate from per-reclaim stack/batch counters.
-	 * Counts successful common-path migrations with a non-NULL source node
-	 * pointer, not validated ownership, unique folios or reclaimed pages.
-	 */
-	atomic64_t cache_ext_migration_success_node_present_folios;
+	/* Failure-only lifecycle counter, kept out of per-reclaim stack stats. */
+	atomic64_t cache_ext_node_alloc_fail_folios;
 
 	struct mem_cgroup_per_node *nodeinfo[];
 };

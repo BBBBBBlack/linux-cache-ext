@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include <linux/btf_ids.h>
 #include <linux/rcupdate_wait.h>
+#include <linux/cache_ext.h>
 
 enum bpf_struct_ops_state {
 	BPF_STRUCT_OPS_STATE_INIT,
@@ -928,21 +929,20 @@ static void bpf_cache_ext_ops_map_link_dealloc(struct bpf_link *link)
 	cgrp = st_link->cgroup;
 
 	if (st_map) {
-		/* st_link->map can be NULL if
-		 * bpf_struct_ops_link_create() fails to register.
+		/* Serialize replacement attachments through the entire teardown.
+		 * Readers never take cache_ext_sem: reclaim can sleep and recursively
+		 * enter filemap hooks while we wait for its SRCU read section.
 		 */
-		st_map->st_ops->unreg(&st_map->kvalue.data, cgrp);
+		down_write(&cgrp->bpf.cache_ext_sem);
+		WRITE_ONCE(cgrp->bpf.cache_ext_enabled, false);
+		rcu_assign_pointer(cgrp->bpf.cache_ext_ops, NULL);
+		cache_ext_cgroup_detach_begin(cgrp);
+		synchronize_srcu(&cache_ext_srcu);
+		st_map->st_ops->unreg(st_map->kvalue.data, cgrp);
+		up_write(&cgrp->bpf.cache_ext_sem);
 		bpf_map_put(&st_map->map);
 	}
-
-	// Disable cache_ext
-	down_write(&cgrp->bpf.cache_ext_sem);
-	cgroup_lock();
-	cgrp->bpf.cache_ext_enabled = false;
-	cgrp->bpf.cache_ext_ops = NULL;
-	cgroup_unlock();
-	up_write(&cgrp->bpf.cache_ext_sem);
-
+	/* A failed registration owns only its cgroup reference, not a policy. */
 	cgroup_put(cgrp);
 	kfree(st_link);
 }
@@ -1056,7 +1056,7 @@ int bpf_cache_ext_ops_link_create(union bpf_attr *attr)
 		return PTR_ERR(map);
 
 	cgrp = cgroup_get_from_fd(attr->link_create.target_fd);
-	if (IS_ERR(map)) {
+	if (IS_ERR(cgrp)) {
 		bpf_map_put(map);
 		return PTR_ERR(cgrp);
 	}
@@ -1064,6 +1064,10 @@ int bpf_cache_ext_ops_link_create(union bpf_attr *attr)
 	st_map = (struct bpf_struct_ops_map *)map;
 
 	if (!bpf_struct_ops_valid_to_reg(map)) {
+		err = -EINVAL;
+		goto err_out;
+	}
+	if (strcmp(st_map->st_ops->name, "cache_ext_ops")) {
 		err = -EINVAL;
 		goto err_out;
 	}
@@ -1080,18 +1084,24 @@ int bpf_cache_ext_ops_link_create(union bpf_attr *attr)
 	if (err)
 		goto err_out;
 
-	err = st_map->st_ops->reg(st_map->kvalue.data, cgrp);
+	/* init must not overlap an old registry teardown or another attach. */
+	down_write(&cgrp->bpf.cache_ext_sem);
+	if (rcu_access_pointer(cgrp->bpf.cache_ext_ops))
+		err = -EBUSY;
+	else
+		err = st_map->st_ops->reg(st_map->kvalue.data, cgrp);
 	if (err) {
+		up_write(&cgrp->bpf.cache_ext_sem);
+		/* cleanup eventually calls dealloc and owns cgrp from now on. */
 		bpf_link_cleanup(&link_primer);
-		link = NULL;
-		goto err_out;
+		bpf_map_put(map);
+		return err;
 	}
 	RCU_INIT_POINTER(link->map, map);
 
-	// Enable cache ext
-	down_write(&cgrp->bpf.cache_ext_sem);
-	cgrp->bpf.cache_ext_ops = (struct cache_ext_ops *)st_map->kvalue.data;
-	cgrp->bpf.cache_ext_enabled = true;
+	rcu_assign_pointer(cgrp->bpf.cache_ext_ops,
+			   (struct cache_ext_ops *)st_map->kvalue.data);
+	WRITE_ONCE(cgrp->bpf.cache_ext_enabled, true);
 	up_write(&cgrp->bpf.cache_ext_sem);
 
 	return bpf_link_settle(&link_primer);

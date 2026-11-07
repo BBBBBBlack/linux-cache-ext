@@ -6902,8 +6902,18 @@ static noinline unsigned long cache_ext_isolate_and_reclaim(struct lruvec* lruve
                                                             struct scan_control* sc,
                                                             bool* active)
 {
-  struct mem_cgroup* memcg = lruvec_memcg(lruvec);
-  struct cache_ext_ops* pcext_ops = get_cache_ext_ops(memcg);
+	struct mem_cgroup* memcg = lruvec_memcg(lruvec);
+	struct cache_ext_ops* pcext_ops;
+	int cache_ext_idx;
+	/* Avoid SRCU work in native-LRU reclaim when no cache_ext policy is
+	 * published. The pointer is rechecked after entering the read section.
+	 */
+	if (!memcg || !rcu_access_pointer(memcg->css.cgroup->bpf.cache_ext_ops)) {
+		*active = false;
+		return 0;
+	}
+	cache_ext_idx = srcu_read_lock(&cache_ext_srcu);
+	pcext_ops = get_cache_ext_ops(memcg);
 
   *active = pcext_ops != NULL && pcext_ops->evict_folios != NULL;
   if (*active)
@@ -6918,8 +6928,10 @@ static noinline unsigned long cache_ext_isolate_and_reclaim(struct lruvec* lruve
     for (int i = 0; i < CACHE_EXT_RECLAIM_NR_STATS; i++)
       if (stats.count[i])
         atomic64_add(stats.count[i], &memcg->cache_ext_reclaim_stats[i]);
+		srcu_read_unlock(&cache_ext_srcu, cache_ext_idx);
     return reclaimed;
   }
+	srcu_read_unlock(&cache_ext_srcu, cache_ext_idx);
   return 0;
 }
 

@@ -15,6 +15,37 @@
 
 MODULE_LICENSE("GPL");
 
+/* Legacy pop has only an opaque handle, no memcg. Validate it without
+ * dereferencing a potentially retired address. Only create/retire/pop use
+ * this index; ordinary list operations use the per-memcg registry.
+ */
+static DEFINE_HASHTABLE(cache_ext_live_lists, 8);
+static DEFINE_SPINLOCK(cache_ext_live_lists_lock);
+
+static struct cache_ext_list *cache_ext_list_lookup_handle(u64 handle)
+{
+  struct cache_ext_list *list, *found = NULL;
+  unsigned long flags;
+
+  /* Caller holds cache_ext_srcu until it finishes using the result. */
+  spin_lock_irqsave(&cache_ext_live_lists_lock, flags);
+  hash_for_each_possible(cache_ext_live_lists, list, global_node, handle)
+    if ((u64)list == handle) {
+      found = list;
+      break;
+    }
+  spin_unlock_irqrestore(&cache_ext_live_lists_lock, flags);
+  return found;
+}
+
+static void cache_ext_list_release(struct rcu_head *head)
+{
+  struct cache_ext_list *list = container_of(head, struct cache_ext_list, retire);
+
+  css_put(&list->owner->css);
+  kfree(list);
+}
+
 /******************************************************************************
  * Linked List ****************************************************************
  *****************************************************************************/
@@ -41,12 +72,17 @@ struct cache_ext_list* cache_ext_list_alloc(void)
   // struct cache_ext_list* list =
   //     kmalloc(sizeof(struct cache_ext_list), GFP_KERNEL);
   struct cache_ext_list* list =
-      kmalloc(sizeof(struct cache_ext_list), GFP_ATOMIC);
+      kzalloc(sizeof(struct cache_ext_list), GFP_ATOMIC);
   if (!list)
   {
     return NULL;
   }
   INIT_LIST_HEAD(&list->head);
+  INIT_HLIST_NODE(&list->h_node);
+  INIT_HLIST_NODE(&list->global_node);
+  list->registry = NULL;
+  list->owner = NULL;
+  list->retired = false;
   return list;
 }
 
@@ -80,8 +116,12 @@ void cache_ext_list_node_free(struct cache_ext_list_node* node)
 
 bool cache_ext_list_node_try_pin(struct cache_ext_list_node* node)
 {
+  /* Caller holds registry->lock (read or write), excluding migration_begin.
+   * A successful pin keeps node->folio immutable until its matching unpin.
+   */
   if (!node || cache_ext_list_node_removed(node) ||
-      cache_ext_list_node_freed(node) || !node->folio)
+      cache_ext_list_node_freed(node) ||
+      cache_ext_list_node_migrating(node) || !node->folio)
     return false;
 
   if (!folio_try_get(node->folio))
@@ -103,6 +143,147 @@ void cache_ext_list_node_unpin(struct cache_ext_list_node* node)
       cache_ext_list_node_removed(node) &&
       cache_ext_list_node_try_mark_freed(node))
     kfree_rcu(node, rcu);
+}
+
+/* Exported native migration helpers also have callers outside
+ * move_to_new_folio (e.g. device migration). Reject a tracked source unless
+ * the caller has entered the binding transaction, rather than silently
+ * migrating its mapping and leaving a stale node. src is locked by caller.
+ */
+bool cache_ext_migration_mapping_ready(struct folio *src)
+{
+  struct cache_ext_list_node *node;
+  bool ready;
+
+  rcu_read_lock();
+  node = READ_ONCE(src->cache_ext_node);
+  ready = !node || (READ_ONCE(node->folio) == src &&
+                   cache_ext_list_node_migrating(node) &&
+                   !cache_ext_list_node_removed(node) &&
+                   !cache_ext_list_node_freed(node));
+  rcu_read_unlock();
+  return ready;
+}
+
+/* Called with src and dst locked, BEFORE the filesystem migration callback.
+ * Never hold registry->lock across that callback: copying, filesystem work
+ * and fallback writeout may sleep or take locks in the opposite order.
+ */
+int cache_ext_migration_begin(struct folio *src, struct folio *dst,
+                             struct cache_ext_migration *migration)
+{
+  struct cache_ext_list_node *node;
+  struct cache_ext_ds_registry *registry;
+  unsigned long flags;
+  int ret = 0;
+
+  migration->node = NULL;
+  migration->registry = NULL;
+  /* Do not overwrite a destination binding, even on an untracked source. */
+  if (READ_ONCE(dst->cache_ext_node))
+    return -EAGAIN;
+
+  rcu_read_lock();
+  node = READ_ONCE(src->cache_ext_node);
+  if (!node)
+    goto out_rcu;
+
+  /* Registries are per NUMA node today; policy list ownership cannot be
+   * silently moved to a different registry. Support that separately.
+   */
+  if (!folio_memcg(src) || folio_nid(src) != folio_nid(dst) ||
+      folio_is_zone_device(src) || folio_is_zone_device(dst) ||
+      folio_nr_pages(src) != folio_nr_pages(dst))
+  {
+    ret = -EAGAIN;
+    goto out_rcu;
+  }
+
+  registry = cache_ext_ds_registry_from_folio(src);
+  /* List helpers currently resolve the policy registry through nodeinfo[0].
+   * Do not pretend a different per-node registry lock protects those lists.
+   */
+  if (registry != cache_ext_ds_registry_from_memcg(folio_memcg(src)))
+  {
+    ret = -EAGAIN;
+    goto out_rcu;
+  }
+  write_lock_irqsave(&registry->lock, flags);
+  /* Detach may have cleared the entry before we acquired the lock. */
+  if (READ_ONCE(src->cache_ext_node) != node)
+  {
+    ret = READ_ONCE(src->cache_ext_node) ? -EAGAIN : 0;
+    goto out_unlock;
+  }
+  if (READ_ONCE(node->folio) != src ||
+      cache_ext_list_node_removed(node) || cache_ext_list_node_freed(node) ||
+      cache_ext_list_node_migrating(node) || atomic_read(&node->pin_count))
+  {
+    ret = -EAGAIN;
+    goto out_unlock;
+  }
+
+  /* A legacy policy handoff can pop an admitted node and carry a raw folio
+   * handle before pushing it back. Do not rebind that unlinked node. This
+   * does not turn the legacy raw-handle API into a lifetime-owning API.
+   */
+  if ((atomic_read(&node->state) & CACHE_EXT_NODE_EVER_ADMITTED) &&
+      list_empty(&node->node))
+  {
+    ret = -EAGAIN;
+    goto out_unlock;
+  }
+
+  atomic_or(CACHE_EXT_NODE_MIGRATING, &node->state);
+  /* Node-only reservation against deletion/detach while locks are dropped.
+   * Ordinary pins are now blocked; no source folio reference is acquired.
+   */
+  atomic_inc(&node->pin_count);
+  migration->node = node;
+  migration->registry = registry;
+out_unlock:
+  write_unlock_irqrestore(&registry->lock, flags);
+out_rcu:
+  rcu_read_unlock();
+  return ret;
+}
+
+void cache_ext_migration_end(struct folio *src, struct folio *dst,
+                            struct cache_ext_migration *migration,
+                            bool success)
+{
+  struct cache_ext_list_node *node = migration->node;
+  struct cache_ext_ds_registry *registry = migration->registry;
+  unsigned long flags;
+
+  if (!node)
+    return;
+
+  write_lock_irqsave(&registry->lock, flags);
+  /* Removal/detach wins: never republish a retired policy's node. The
+   * reservation keeps the object alive even if it has been unlinked.
+   */
+  if (success && !cache_ext_list_node_removed(node) &&
+      !cache_ext_list_node_freed(node))
+  {
+    WRITE_ONCE(src->cache_ext_node, NULL);
+    WRITE_ONCE(node->folio, dst);
+    smp_store_release(&dst->cache_ext_node, node);
+    /* Same registry, node, queue position, metadata and ready_generation.
+     * No folio_added/folios_evicted hook: migration is NOT an eviction.
+     */
+  }
+  atomic_andnot(CACHE_EXT_NODE_MIGRATING, &node->state);
+  /* Unlike ordinary unpin, this must NOT put either folio. Native migration
+   * owns their references. Release under the lock to serialize with teardown.
+   */
+  if (atomic_dec_and_test(&node->pin_count) &&
+      cache_ext_list_node_removed(node) &&
+      cache_ext_list_node_try_mark_freed(node))
+    kfree_rcu(node, rcu);
+  write_unlock_irqrestore(&registry->lock, flags);
+  migration->node = NULL;
+  migration->registry = NULL;
 }
 
 static inline struct cache_ext_list_node*
@@ -191,6 +372,11 @@ int __cache_ext_list_add_impl(struct cache_ext_list* list, struct folio* folio,
     return -EINVAL;
 
   reg_flags = cache_ext_ds_registry_write_lock(folio);
+  if (list->retired)
+  {
+    cache_ext_ds_registry_write_unlock(folio, reg_flags);
+    return -ESTALE;
+  }
   node = cache_ext_folio_to_node_fast(folio);
   if (!node)
   {
@@ -224,6 +410,69 @@ int cache_ext_list_add_tail(struct cache_ext_list* list, struct folio* folio)
   return __cache_ext_list_add_impl(list, folio, true);
 }
 
+/* Generation-aware admission is one transaction: no policy callback can see
+ * the new list entry before its metadata is initialized. A temporarily sampled
+ * (unlinked) node is already admitted and must not be initialized a second time.
+ * The caller reserves its policy count before this call, rolling back on error.
+ */
+__bpf_kfunc int bpf_cache_ext_list_admit_tail(u64 list_id, struct folio* folio,
+                                            u64 generation, u64 metadata0,
+                                            u64 metadata1)
+{
+  struct cache_ext_ds_registry* registry;
+  struct cache_ext_list* list;
+  struct cache_ext_list* target = NULL;
+  struct cache_ext_list_node* node;
+  unsigned long flags;
+  int ret = 0;
+
+  if (!folio || !generation || !folio_memcg(folio))
+    return -EINVAL;
+  registry = cache_ext_ds_registry_from_folio(folio);
+  write_lock_irqsave(&registry->lock, flags);
+  if (registry->generation != generation)
+  {
+    ret = -ESTALE;
+    goto out;
+  }
+  /* Resolve the opaque list handle under the same lock as the mutation. */
+  hash_for_each_possible(registry->ds_hash, list, h_node, list_id)
+  {
+    if ((u64)list == list_id)
+    {
+      target = list;
+      break;
+    }
+  }
+  if (!target)
+  {
+    ret = -ENOENT;
+    goto out;
+  }
+  node = cache_ext_folio_to_node_fast(folio);
+  if (!node)
+  {
+    ret = -ESTALE;
+    goto out;
+  }
+  /* Preserve all existing-state guards, without diagnostic classification. */
+  if (!list_empty(&node->node) || READ_ONCE(node->ready_generation) ||
+      (atomic_read(&node->state) & CACHE_EXT_NODE_EVER_ADMITTED))
+  {
+    ret = -EEXIST;
+    goto out;
+  }
+  node->metadata[0] = metadata0;
+  node->metadata[1] = metadata1;
+  list_add_tail(&node->node, &target->head);
+  /* Retain the legacy bit for policies still using the old admission API. */
+  atomic_or(CACHE_EXT_NODE_EVER_ADMITTED, &node->state);
+  smp_store_release(&node->ready_generation, generation);
+out:
+  write_unlock_irqrestore(&registry->lock, flags);
+  return ret;
+}
+
 int cache_ext_list_move(struct cache_ext_list* list, struct folio* folio,
                         bool tail)
 {
@@ -234,6 +483,11 @@ int cache_ext_list_move(struct cache_ext_list* list, struct folio* folio,
     return -1;
 
   reg_flags = cache_ext_ds_registry_write_lock(folio);
+  if (list->retired)
+  {
+    cache_ext_ds_registry_write_unlock(folio, reg_flags);
+    return -ESTALE;
+  }
   node = cache_ext_folio_to_node_fast(folio);
   if (!node)
   {
@@ -295,7 +549,7 @@ struct folio* cache_ext_list_pop(struct cache_ext_list* list, bool tail)
     return NULL;
 
   write_lock_irqsave(&list->registry->lock, flags);
-  if (list_empty(&list->head))
+  if (list->retired || list_empty(&list->head))
   {
     write_unlock_irqrestore(&list->registry->lock, flags);
     return NULL;
@@ -305,6 +559,12 @@ struct folio* cache_ext_list_pop(struct cache_ext_list* list, bool tail)
     node = list_last_entry(&list->head, struct cache_ext_list_node, node);
   else
     node = list_first_entry(&list->head, struct cache_ext_list_node, node);
+
+  if (cache_ext_list_node_migrating(node))
+  {
+    write_unlock_irqrestore(&list->registry->lock, flags);
+    return NULL;
+  }
 
   list_del_init(&node->node);
   folio = node->folio;
@@ -353,12 +613,24 @@ int cache_ext_list_iterate(struct mem_cgroup* memcg,
   struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_memcg(memcg);
   read_lock_irqsave(&registry->lock, flags);
 
+  if (list->retired)
+  {
+    read_unlock_irqrestore(&registry->lock, flags);
+    return -ESTALE;
+  }
+
   list_for_each_entry(node, &list->head, node)
   {
     if (iter > max_iter)
     {
       ret = CACHE_EXT_MAX_ITER_REACHED;
       break;
+    }
+
+    if (cache_ext_list_node_migrating(node))
+    {
+      iter++;
+      continue;
     }
 
     // TODO: Ensure that we don't let the callback use any of the list
@@ -553,6 +825,12 @@ int cache_ext_list_iterate_extended(struct mem_cgroup* memcg,
   else
     write_lock_irqsave(&registry->lock, flags);
 
+  if (list->retired || continue_list->retired || evict_list->retired ||
+      retry_list->retired || deferred_list->retired)
+  {
+    ret = -ESTALE;
+    goto unlock;
+  }
   if (list_empty(&list->head))
     goto unlock;
 
@@ -574,6 +852,17 @@ int cache_ext_list_iterate_extended(struct mem_cgroup* memcg,
     {
       ret = CACHE_EXT_MAX_ITER_REACHED;
       break;
+    }
+
+    /* Before deferred processing too: that path dereferences node->folio.
+     * Do not rotate or change metadata for a migration-in-progress node.
+     */
+    if (cache_ext_list_node_migrating(node))
+    {
+      iter++;
+      if (reached_stop)
+        break;
+      continue;
     }
 
     if (cache_ext_list_node_consume_reclaim_deferred(memcg, node))
@@ -679,17 +968,30 @@ unlock:
 int cache_ext_list_free(struct cache_ext_list* list)
 {
   struct cache_ext_list_node *node, *tmp;
+
+  /* registry write lock held. Unpublish before deferred release; a helper
+   * that resolved this handle earlier must observe retired under the lock.
+   */
+  list->retired = true;
+  spin_lock(&cache_ext_live_lists_lock);
+  hash_del(&list->global_node);
+  spin_unlock(&cache_ext_live_lists_lock);
   list_for_each_entry_safe(node, tmp, &list->head, node)
   {
     list_del_init(&node->node);
   }
 
-  kfree(list);
+  call_srcu(&cache_ext_srcu, &list->retire, cache_ext_list_release);
   return 0;
 }
 
 // BPF API
 
+/* These kfuncs are called from cache_ext_ops callbacks.  Their native hook
+ * holds cache_ext_srcu across the entire BPF callback; attach initialization
+ * is serialized against detach by cache_ext_sem.  Avoid nesting SRCU on every
+ * policy list operation in the hot path.
+ */
 __bpf_kfunc int bpf_cache_ext_list_add(u64 list, struct folio* folio)
 {
   struct cache_ext_list* list_ptr;
@@ -739,8 +1041,8 @@ __bpf_kfunc int bpf_cache_ext_list_del(struct folio* folio)
 
 __bpf_kfunc struct folio* bpf_cache_ext_list_pop(u64 list, bool tail)
 {
-  struct cache_ext_list* list_ptr = (struct cache_ext_list*)list;
-  if (!list_ptr || !list_ptr->registry)
+  struct cache_ext_list* list_ptr = cache_ext_list_lookup_handle(list);
+  if (!list_ptr)
     return NULL;
 
   return cache_ext_list_pop(list_ptr, tail);
@@ -803,6 +1105,8 @@ enum cache_ext_sample_node_state
 
 void __putback_list_nodes(struct cache_ext_list* list, struct cache_ext_list_node** sample_folios_arr, int size)
 {
+  if (list->retired)
+    return;
   for (int i = 0; i < size; i++)
   {
     struct cache_ext_list_node* node = sample_folios_arr[i];
@@ -892,6 +1196,9 @@ static void __putback_sample_nodes_extended(
                                                evict_list, deferred_list,
                                                sample_state_arr[i]);
     mode = cache_ext_sample_target_mode(opts, sample_state_arr[i]);
+
+    if (target_list->retired)
+      continue;
 
     if (mode == CACHE_EXT_ITERATE_HEAD)
       list_add(&node->node, &target_list->head);
@@ -1005,6 +1312,13 @@ int __bpf_cache_ext_list_sample_extended(struct mem_cgroup* memcg, u64 list,
 
   write_lock_irqsave(&registry->lock, flags);
 
+  if (list_ptr->retired || sampled_list->retired || evict_list->retired ||
+      deferred_list->retired)
+  {
+    write_unlock_irqrestore(&registry->lock, flags);
+    return -ESTALE;
+  }
+
   // Optimization: Snip the front of the list and select the pages without
   // holding the lock.
   for (int attempts = 0; sample_folios_size < num_folios_to_sample &&
@@ -1021,6 +1335,11 @@ int __bpf_cache_ext_list_sample_extended(struct mem_cgroup* memcg, u64 list,
     }
     struct cache_ext_list_node* node = list_first_entry(
         &list_ptr->head, struct cache_ext_list_node, node);
+    /* Leave its policy position untouched while migration owns the binding.
+     * Score any samples already obtained; do not repeatedly retry this head.
+     */
+    if (cache_ext_list_node_migrating(node))
+      break;
     if (!cache_ext_list_node_try_pin(node))
     {
       list_move_tail(&node->node, &list_ptr->head);
@@ -1214,6 +1533,7 @@ enum cache_ext_list_ops_type
 BTF_SET8_START(cache_ext_list_ops)
 BTF_ID_FLAGS(func, bpf_cache_ext_list_add)
 BTF_ID_FLAGS(func, bpf_cache_ext_list_add_tail)
+BTF_ID_FLAGS(func, bpf_cache_ext_list_admit_tail)
 BTF_ID_FLAGS(func, bpf_cache_ext_list_del)
 BTF_ID_FLAGS(func, bpf_cache_ext_list_pop, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cache_ext_list_iterate_scan)
@@ -1266,6 +1586,51 @@ void cache_ext_ds_registry_init(struct cache_ext_ds_registry* registry)
   INIT_LIST_HEAD(&registry->all_nodes);
   spin_lock_init(&registry->all_nodes_lock);
   atomic64_set(&registry->nr_nodes, 0);
+  registry->generation = 0;
+  registry->closing = false;
+  RCU_INIT_POINTER(registry->ghost_fifo, NULL);
+}
+
+/* Never recycle a generation within a boot, including failed attachments.
+ * Saturate rather than wrapping to an earlier identity.
+ */
+static atomic64_t cache_ext_generation_sequence = ATOMIC64_INIT(0);
+
+int cache_ext_ds_registry_begin_generation(struct mem_cgroup* memcg)
+{
+  struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_memcg(memcg);
+  unsigned long flags;
+  s64 previous;
+  int ret = 0;
+
+  write_lock_irqsave(&registry->lock, flags);
+  if (registry->generation)
+  {
+    ret = -EBUSY;
+    goto out;
+  }
+  previous = atomic64_fetch_add_unless(&cache_ext_generation_sequence, 1, S64_MAX);
+  if (previous == S64_MAX)
+  {
+    ret = -EOVERFLOW;
+    goto out;
+  }
+  WRITE_ONCE(registry->generation, (u64)previous + 1);
+  registry->closing = false;
+out:
+  write_unlock_irqrestore(&registry->lock, flags);
+  return ret;
+}
+
+void cache_ext_ds_registry_close(struct mem_cgroup* memcg)
+{
+  struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_memcg(memcg);
+  unsigned long flags;
+
+  write_lock_irqsave(&registry->lock, flags);
+  registry->closing = true;
+  WRITE_ONCE(registry->generation, 0);
+  write_unlock_irqrestore(&registry->lock, flags);
 }
 
 struct cache_ext_ds_registry*
@@ -1284,15 +1649,20 @@ struct cache_ext_list* cache_ext_ds_registry_new_list(struct mem_cgroup* memcg)
   }
   unsigned long flags;
   write_lock_irqsave(&registry->lock, flags);
-  if (registry->nr_entries >= CACHE_EXT_REGISTRY_MAX_ENTRIES)
+  if (registry->closing || registry->nr_entries >= CACHE_EXT_REGISTRY_MAX_ENTRIES)
   {
     write_unlock_irqrestore(&registry->lock, flags);
-    cache_ext_list_free(list);
+    kfree(list);
     return NULL;
   }
   list->registry = registry;
+  list->owner = memcg;
+  css_get(&memcg->css);
   u64 key = (u64)list;
   hash_add(registry->ds_hash, &list->h_node, key);
+  spin_lock(&cache_ext_live_lists_lock);
+  hash_add(cache_ext_live_lists, &list->global_node, key);
+  spin_unlock(&cache_ext_live_lists_lock);
   registry->nr_entries++;
   write_unlock_irqrestore(&registry->lock, flags);
 
@@ -1372,8 +1742,13 @@ void cache_ext_ds_registry_del_all(struct mem_cgroup* memcg)
   struct hlist_node* tmp;
   struct cache_ext_list* cur_list;
   struct cache_ext_list_node *node, *node_tmp;
+  struct cache_ext_ghost_fifo *ghost;
   struct cache_ext_ds_registry* registry = cache_ext_ds_registry_from_memcg(memcg);
   write_lock_irqsave(&registry->lock, flags);
+  registry->closing = true;
+  WRITE_ONCE(registry->generation, 0);
+  ghost = rcu_dereference_protected(registry->ghost_fifo, 1);
+  RCU_INIT_POINTER(registry->ghost_fifo, NULL);
   hash_for_each_safe(registry->ds_hash, bkt, tmp, cur_list, h_node)
   {
     hash_del(&cur_list->h_node);
@@ -1385,6 +1760,14 @@ void cache_ext_ds_registry_del_all(struct mem_cgroup* memcg)
   list_for_each_entry_safe(node, node_tmp, &registry->all_nodes, all_node)
   {
     struct folio* folio = READ_ONCE(node->folio);
+
+    /* New page-cache entries created after detach closed the registry have
+     * no policy membership. Keep their base node alive across this sweep.
+     */
+    if (atomic_read(&node->state) & CACHE_EXT_NODE_DETACH_PRESERVE) {
+      atomic_andnot(CACHE_EXT_NODE_DETACH_PRESERVE, &node->state);
+      continue;
+    }
 
     cache_ext_list_node_mark_removed(node);
     if (folio && READ_ONCE(folio->cache_ext_node) == node)
@@ -1398,6 +1781,7 @@ void cache_ext_ds_registry_del_all(struct mem_cgroup* memcg)
   spin_unlock(&registry->all_nodes_lock);
 
   write_unlock_irqrestore(&registry->lock, flags);
+  cache_ext_ghost_fifo_retire(ghost);
 }
 
 // BPF API
@@ -1405,6 +1789,14 @@ void cache_ext_ds_registry_del_all(struct mem_cgroup* memcg)
 __bpf_kfunc u64 bpf_cache_ext_ds_registry_new_list(struct mem_cgroup* memcg)
 {
   return (u64)cache_ext_ds_registry_new_list(memcg);
+}
+
+/* Read once at policy init; not a per-access memcg lookup. */
+__bpf_kfunc u64 bpf_cache_ext_policy_generation(struct mem_cgroup* memcg)
+{
+  if (!memcg)
+    return 0;
+  return READ_ONCE(cache_ext_ds_registry_from_memcg(memcg)->generation);
 }
 
 __bpf_kfunc u64 bpf_cache_ext_ds_registry_new_list_from_folio(struct folio* folio)
@@ -1417,6 +1809,7 @@ __bpf_kfunc u64 bpf_cache_ext_ds_registry_new_list_from_folio(struct folio* foli
 
 BTF_SET8_START(cache_ext_registry_ops)
 BTF_ID_FLAGS(func, bpf_cache_ext_ds_registry_new_list)
+BTF_ID_FLAGS(func, bpf_cache_ext_policy_generation)
 BTF_ID_FLAGS(func, bpf_cache_ext_ds_registry_new_list_from_folio)
 BTF_SET8_END(cache_ext_registry_ops)
 
@@ -1536,6 +1929,21 @@ __bpf_kfunc struct cache_ext_list_node* bpf_cache_ext_folio_to_node(struct folio
   return NULL;
 }
 
+/* Same lifetime contract as folio_to_node: the caller must protect the folio
+ * and node (accessed runs inside RCU). Acquire pairs with admit_tail's publish.
+ * A generation is neither an RCU read lock nor a reference/pin.
+ */
+__bpf_kfunc struct cache_ext_list_node*
+bpf_cache_ext_folio_to_ready_node(struct folio* folio, u64 generation)
+{
+  struct cache_ext_list_node* node = cache_ext_folio_to_node_fast(folio);
+
+  if (!node || !generation ||
+      smp_load_acquire(&node->ready_generation) != generation)
+    return NULL;
+  return node;
+}
+
 static inline void metadata_copy(u64* dst, const void* src, u32 sz)
 {
   const u64* s = src;
@@ -1596,6 +2004,7 @@ BTF_ID_FLAGS(func, bpf_cache_ext_handle_to_evicted_ctx, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cgroup_to_memcg, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cache_ext_folio_to_memcg, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cache_ext_folio_to_node, KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_cache_ext_folio_to_ready_node, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cache_ext_folio_set_metadata)
 BTF_ID_FLAGS(func, bpf_cache_ext_folio_add_metadata)
 BTF_ID_FLAGS(func, bpf_cache_ext_node_set_metadata)

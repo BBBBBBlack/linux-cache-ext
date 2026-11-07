@@ -260,17 +260,18 @@ struct mem_cgroup *vmpressure_to_memcg(struct vmpressure *vmpr)
  */
 
 bool cache_ext_cgroup_enabled(struct cgroup *cgroup) {
-	down_read(&cgroup->bpf.cache_ext_sem);
-	bool res = cgroup->bpf.cache_ext_enabled;
-	up_read(&cgroup->bpf.cache_ext_sem);
-
-	return res;
+	return READ_ONCE(cgroup->bpf.cache_ext_enabled);
 }
 
 noinline struct cache_ext_ops *get_cache_ext_ops(struct mem_cgroup *memcg)
 {
-	if (memcg && memcg->cache_ext_valid && cache_ext_cgroup_enabled(memcg->css.cgroup))
-		return memcg->css.cgroup->bpf.cache_ext_ops;
+	/* Caller holds cache_ext_srcu until its LAST use of ops/resources.
+	 * Pointer publication is the admission gate; the enabled bit is not a
+	 * second independently sampled lifetime decision.
+	 */
+	if (memcg && memcg->cache_ext_valid)
+		return srcu_dereference(memcg->css.cgroup->bpf.cache_ext_ops,
+					&cache_ext_srcu);
 	return NULL;
 }
 
@@ -346,15 +347,30 @@ void valid_folios_add(struct folio *folio) {
 
 	node = cache_ext_list_node_alloc(folio);
 	if (!node) {
+		struct mem_cgroup *memcg = folio_memcg(folio);
+
+		/* Local memcg count, including files outside the policy watchlist.
+		 * This counts failed allocation attempts, not unique missing pages.
+		 */
+		if (memcg)
+			atomic64_inc(&memcg->cache_ext_node_alloc_fail_folios);
 		return;
 	}
 
 	registry = cache_ext_ds_registry_from_folio(folio);
 
-	spin_lock_irqsave(&registry->all_nodes_lock, flags);
+	/* Serialize publication with teardown. If detach has closed the current
+	 * policy, retain this new folio node for later page-cache lifecycle events
+	 * instead of letting the teardown sweep mistake it for an old node.
+	 */
+	write_lock_irqsave(&registry->lock, flags);
+	if (registry->closing)
+		atomic_or(CACHE_EXT_NODE_DETACH_PRESERVE, &node->state);
+	spin_lock(&registry->all_nodes_lock);
 	existing = READ_ONCE(folio->cache_ext_node);
 	if (existing) {
-		spin_unlock_irqrestore(&registry->all_nodes_lock, flags);
+		spin_unlock(&registry->all_nodes_lock);
+		write_unlock_irqrestore(&registry->lock, flags);
 		cache_ext_list_node_free(node);
 		return;
 	}
@@ -362,7 +378,8 @@ void valid_folios_add(struct folio *folio) {
 	list_add_tail(&node->all_node, &registry->all_nodes);
 	atomic64_inc(&registry->nr_nodes);
 	WRITE_ONCE(folio->cache_ext_node, node);
-	spin_unlock_irqrestore(&registry->all_nodes_lock, flags);
+	spin_unlock(&registry->all_nodes_lock);
+	write_unlock_irqrestore(&registry->lock, flags);
 }
 
 /*
@@ -377,17 +394,26 @@ void valid_folios_del(struct folio *folio) {
 	if (!folio)
 		return;
 
+	/* A detach can clear/free the node between the pointer load and lock.
+	 * kfree_rcu protects this independent deletion path, not just callbacks.
+	 */
+	guard(rcu)();
 	node = READ_ONCE(folio->cache_ext_node);
 	if (!node)
 		return;
 
 	registry = cache_ext_ds_registry_from_folio(folio);
 
+	/* Serialize readiness invalidation with transactional admission. */
+	reg_flags = cache_ext_ds_registry_write_lock(folio);
+	if (READ_ONCE(folio->cache_ext_node) != node) {
+		cache_ext_ds_registry_write_unlock(folio, reg_flags);
+		return;
+	}
 	cache_ext_list_node_mark_removed(node);
 	if (READ_ONCE(folio->cache_ext_node) == node)
 		WRITE_ONCE(folio->cache_ext_node, NULL);
 
-	reg_flags = cache_ext_ds_registry_write_lock(folio);
 	if (!list_empty(&node->node))
 		list_del_init(&node->node);
 	cache_ext_ds_registry_write_unlock(folio, reg_flags);
@@ -5525,7 +5551,7 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 		return ERR_PTR(error);
 	for (i = 0; i < CACHE_EXT_RECLAIM_NR_STATS; i++)
 		atomic64_set(&memcg->cache_ext_reclaim_stats[i], 0);
-	atomic64_set(&memcg->cache_ext_migration_success_node_present_folios, 0);
+	atomic64_set(&memcg->cache_ext_node_alloc_fail_folios, 0);
 
 	memcg->id.id = idr_alloc(&mem_cgroup_idr, NULL,
 				 1, MEM_CGROUP_ID_MAX + 1, GFP_KERNEL);
@@ -6873,10 +6899,8 @@ static int cache_ext_reclaim_stat_show(struct seq_file *m, void *v)
 	for (i = 0; i < CACHE_EXT_RECLAIM_NR_STATS; i++)
 		seq_printf(m, "%s %llu\n", names[i],
 			   (unsigned long long)atomic64_read(&memcg->cache_ext_reclaim_stats[i]));
-	/* Same diagnostics file, but not a reclaim result or part of its batch. */
-	seq_printf(m, "migration_success_node_present_folios %llu\n",
-		   (unsigned long long)atomic64_read(
-			   &memcg->cache_ext_migration_success_node_present_folios));
+	seq_printf(m, "node_alloc_fail_folios %llu\n",
+		   (unsigned long long)atomic64_read(&memcg->cache_ext_node_alloc_fail_folios));
 	return 0;
 }
 

@@ -490,7 +490,7 @@ int cgroup_bpf_inherit(struct cgroup *cgrp)
 
 	init_rwsem(&cgrp->bpf.cache_ext_sem);
 	cgrp->bpf.cache_ext_enabled = false;
-	cgrp->bpf.cache_ext_ops = NULL;
+	RCU_INIT_POINTER(cgrp->bpf.cache_ext_ops, NULL);
 
 	return 0;
 cleanup:

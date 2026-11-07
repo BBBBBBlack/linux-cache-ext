@@ -6,6 +6,23 @@
 #include <linux/mm_types.h>
 #include <linux/types.h>
 
+DEFINE_SRCU(cache_ext_srcu);
+
+/* Called after the ops pointer is unpublished and before the SRCU drain.
+ * Closing the registry distinguishes new page-cache nodes from nodes owned
+ * by the policy that is about to be retired.
+ */
+void cache_ext_cgroup_detach_begin(struct cgroup *cgrp)
+{
+  struct mem_cgroup *memcg;
+
+  if (!cgrp || !cgrp->subsys[memory_cgrp_id])
+    return;
+  memcg = mem_cgroup_from_css(cgrp->subsys[memory_cgrp_id]);
+  if (memcg)
+    cache_ext_ds_registry_close(memcg);
+}
+
 static const struct btf_type* cache_ext_eviction_ctx_type;
 static const struct btf_type* cache_ext_admission_ctx_type;
 static const struct btf_type* cache_ext_list_node_type;
@@ -159,6 +176,9 @@ static int bpf_cache_ext_reg(void* kdata, void* more_data)
     pr_crit("cache_ext: failed to get memcg for registration!\n");
     return -EINVAL;
   }
+  ret = cache_ext_ds_registry_begin_generation(memcg);
+  if (ret)
+    return ret;
   pr_info("cache_ext: Calling init\n");
   if (ops->init)
   {

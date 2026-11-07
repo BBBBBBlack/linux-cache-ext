@@ -11,9 +11,17 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/atomic.h>
+#include <linux/srcu.h>
 // #include <linux/bpf.h>
 
 typedef u64 (*bpf_callback_t)(u64, u64, u64, u64, u64);
+
+/* Covers complete ops invocations, including sleeping reclaim, and list
+ * helper lookup/use intervals. Never wait for this domain from a reader.
+ */
+extern struct srcu_struct cache_ext_srcu;
+struct cgroup;
+void cache_ext_cgroup_detach_begin(struct cgroup *cgrp);
 
 /* Local to the reclaiming memcg, not hierarchical. Counters ending in _pages
  * are page counts in PAGE_SIZE units; calls, *_calls, and *_folios are event or
@@ -90,6 +98,10 @@ struct cache_ext_list
   struct hlist_node h_node;
   // Reverse pointer to registry for lock access without needing memcg
   struct cache_ext_ds_registry* registry;
+  struct mem_cgroup *owner;
+  struct hlist_node global_node;
+  struct rcu_head retire;
+  bool retired;
 };
 
 struct cache_ext_list_node
@@ -114,6 +126,12 @@ struct cache_ext_list_node
    * changes, while all_node follows the folio/cache_ext_node lifetime.
    */
   struct list_head all_node;
+
+  /* 0 until metadata and admission are complete. Published with release,
+   * consumed with acquire; not a pin or a current-list-membership flag.
+   * Appended to preserve existing BPF-visible offsets.
+   */
+  u64 ready_generation;
 };
 
 #define CACHE_EXT_NODE_REMOVED BIT(0)
@@ -124,6 +142,15 @@ struct cache_ext_list_node
  * Set under registry->lock and retained until this node is freed.
  */
 #define CACHE_EXT_NODE_EVER_ADMITTED BIT(4)
+/* Migration owns the binding; ordinary pins and list callbacks must wait. */
+#define CACHE_EXT_NODE_MIGRATING BIT(5)
+/* Folios added after detach closes publication survive the teardown sweep. */
+#define CACHE_EXT_NODE_DETACH_PRESERVE BIT(6)
+
+static inline bool cache_ext_list_node_migrating(struct cache_ext_list_node* node)
+{
+  return atomic_read(&node->state) & CACHE_EXT_NODE_MIGRATING;
+}
 
 static inline bool cache_ext_list_node_removed(struct cache_ext_list_node* node)
 {
@@ -148,6 +175,7 @@ static inline bool cache_ext_list_node_recent_deferred(struct cache_ext_list_nod
 static inline void cache_ext_list_node_mark_removed(struct cache_ext_list_node* node)
 {
   atomic_or(CACHE_EXT_NODE_REMOVED, &node->state);
+  smp_store_release(&node->ready_generation, 0);
 }
 
 static inline void cache_ext_list_node_mark_reclaim_deferred(struct cache_ext_list_node* node)
@@ -237,11 +265,32 @@ void cache_ext_list_node_free(struct cache_ext_list_node* node);
 bool cache_ext_list_node_try_pin(struct cache_ext_list_node* node);
 void cache_ext_list_node_unpin(struct cache_ext_list_node* node);
 
+/* Stack-only transaction. The reservation pins the NODE, not the source
+ * folio: an extra folio reference would make native migration fail its
+ * expected-refcount check. Do not release it with node_unpin().
+ */
+struct cache_ext_migration {
+  struct cache_ext_list_node *node;
+  struct cache_ext_ds_registry *registry;
+};
+int cache_ext_migration_begin(struct folio *src, struct folio *dst,
+                             struct cache_ext_migration *migration);
+bool cache_ext_migration_mapping_ready(struct folio *src);
+void cache_ext_migration_end(struct folio *src, struct folio *dst,
+                            struct cache_ext_migration *migration,
+                            bool success);
+
 /*
  * cache_ext data structure registry.
  */
 
 #define CACHE_EXT_REGISTRY_MAX_ENTRIES 5
+
+struct cache_ext_ghost_fifo;
+void cache_ext_ghost_fifo_retire(struct cache_ext_ghost_fifo *ghost);
+int bpf_cache_ext_ghost_fifo_init(struct mem_cgroup *memcg, u32 capacity);
+int bpf_cache_ext_ghost_fifo_record(struct folio *folio, u64 generation, u64 key0, u64 key1);
+int bpf_cache_ext_ghost_fifo_consume(struct folio *folio, u64 generation, u64 key0, u64 key1);
 
 // NOTE: For now, tie the registry lifetime to the struct_ops lifetime.
 // Release all the data structures when the struct_ops is released.
@@ -256,9 +305,17 @@ struct cache_ext_ds_registry
   struct list_head all_nodes;
   spinlock_t all_nodes_lock;
   atomic64_t nr_nodes;
+  /* Nonzero, boot-unique attachment identity; guarded by lock. */
+  u64 generation;
+  /* Blocks list creation during teardown; new folio nodes are retained. */
+  bool closing;
+  /* Optional FIFO history, lifetime guarded by RCU, mutations by its own lock. */
+  struct cache_ext_ghost_fifo __rcu *ghost_fifo;
 };
 
 void cache_ext_ds_registry_init(struct cache_ext_ds_registry* registry);
+int cache_ext_ds_registry_begin_generation(struct mem_cgroup* memcg);
+void cache_ext_ds_registry_close(struct mem_cgroup* memcg);
 unsigned long cache_ext_ds_registry_read_lock(struct folio* folio);
 void cache_ext_ds_registry_read_unlock(struct folio* folio, unsigned long flags);
 unsigned long cache_ext_ds_registry_write_lock(struct folio* folio);

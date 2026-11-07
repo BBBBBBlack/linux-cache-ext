@@ -51,6 +51,7 @@
 #include <linux/sched/sysctl.h>
 #include <linux/memory-tiers.h>
 #include <linux/memcontrol.h>
+#include <linux/cache_ext.h>
 
 #include <asm/tlbflush.h>
 
@@ -406,6 +407,9 @@ int folio_migrate_mapping(struct address_space *mapping,
 	int dirty;
 	int expected_count = folio_expected_refs(mapping, folio) + extra_count;
 	long nr = folio_nr_pages(folio);
+
+	if (!cache_ext_migration_mapping_ready(folio))
+		return -EAGAIN;
 
 	if (!mapping) {
 		/* Anonymous page without mapping */
@@ -948,12 +952,17 @@ static int move_to_new_folio(struct folio *dst, struct folio *src,
 {
 	int rc = -EAGAIN;
 	bool is_lru = !__PageMovable(&src->page);
+	struct cache_ext_migration cache_ext_migration = {};
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(src), src);
 	VM_BUG_ON_FOLIO(!folio_test_locked(dst), dst);
 
 	if (likely(is_lru)) {
 		struct address_space *mapping = folio_mapping(src);
+
+		rc = cache_ext_migration_begin(src, dst, &cache_ext_migration);
+		if (rc)
+			return rc;
 
 		if (!mapping)
 			rc = migrate_folio(mapping, dst, src, mode);
@@ -969,6 +978,12 @@ static int move_to_new_folio(struct folio *dst, struct folio *src,
 								mode);
 		else
 			rc = fallback_migrate_folio(mapping, dst, src, mode);
+
+		/* Finish before src->mapping is cleared or src can be freed.
+		 * Both folios remain locked; failed migrations keep the old binding.
+		 */
+		cache_ext_migration_end(src, dst, &cache_ext_migration,
+					rc == MIGRATEPAGE_SUCCESS);
 	} else {
 		const struct movable_operations *mops;
 
@@ -994,19 +1009,6 @@ static int move_to_new_folio(struct folio *dst, struct folio *src,
 	 * src is freed; but stats require that PageAnon be left as PageAnon.
 	 */
 	if (rc == MIGRATEPAGE_SUCCESS) {
-#ifdef CONFIG_MEMCG
-		/* Diagnostic only: source is still locked/alive here. Do not touch
-		 * the node or alter migration/list membership. A retained pointer
-		 * may already be stale; count presence, not validated ownership.
-		 */
-		if (READ_ONCE(src->cache_ext_node)) {
-			struct mem_cgroup *memcg = folio_memcg(src);
-
-			if (memcg && memcg->cache_ext_valid)
-				atomic64_inc(
-					&memcg->cache_ext_migration_success_node_present_folios);
-		}
-#endif
 		if (__PageMovable(&src->page)) {
 			VM_BUG_ON_FOLIO(!folio_test_isolated(src), src);
 
