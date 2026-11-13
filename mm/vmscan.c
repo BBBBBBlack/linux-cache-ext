@@ -6937,6 +6937,30 @@ static noinline unsigned long cache_ext_isolate_and_reclaim(struct lruvec* lruve
 
 /*****************************************************************************/
 
+/*
+ * cache_ext inactive-file budget mode, an experimental runtime switch at
+ * /sys/module/vmscan/parameters/cache_ext_budget_mode (boot:
+ * vmscan.cache_ext_budget_mode=N).  It only affects lruvecs whose memcg has
+ * an active cache_ext evict_folios op.
+ *
+ *   0  legacy: when cache_ext does not meet the whole remaining reclaim goal,
+ *      the kernel LRU still scans the full inactive-file budget.  Under
+ *      kswapd or small priority-scaled budgets this lets the kernel LRU
+ *      reclaim about as many pages as the policy did.
+ *   1  deduct: pages reclaimed through cache_ext consume the inactive-file
+ *      budget, so the kernel LRU only scans the shortfall (the behavior
+ *      before commit 79b4d5bc3, without its 80% early return).
+ *   2  deduct, and when the priority-scaled budget is below one
+ *      SWAP_CLUSTER_MAX batch, let cache_ext take up to one batch of the
+ *      remaining goal.
+ *
+ * Other values behave as 0.  The default keeps existing results comparable.
+ */
+static int cache_ext_budget_mode __read_mostly;
+module_param(cache_ext_budget_mode, int, 0644);
+MODULE_PARM_DESC(cache_ext_budget_mode,
+                 "cache_ext inactive-file budget: 0 legacy, 1 deduct, 2 deduct with batch floor");
+
 static void shrink_lruvec(struct lruvec* lruvec, struct scan_control* sc)
 {
   unsigned long nr[NR_LRU_LISTS];
@@ -6983,6 +7007,7 @@ static void shrink_lruvec(struct lruvec* lruvec, struct scan_control* sc)
   unsigned long cache_ext_target;
   unsigned long cache_ext_reclaimed;
   bool cache_ext_active;
+  int budget_mode = READ_ONCE(cache_ext_budget_mode);
 
   if (sc->nr_reclaimed >= sc->nr_to_reclaim)
     remaining_to_reclaim = 0;
@@ -6990,6 +7015,8 @@ static void shrink_lruvec(struct lruvec* lruvec, struct scan_control* sc)
     remaining_to_reclaim = sc->nr_to_reclaim - sc->nr_reclaimed;
 
   cache_ext_target = min(file_scan_budget, remaining_to_reclaim);
+  if (budget_mode == 2 && cache_ext_target < SWAP_CLUSTER_MAX)
+    cache_ext_target = min(remaining_to_reclaim, SWAP_CLUSTER_MAX);
   cache_ext_reclaimed =
       cache_ext_isolate_and_reclaim(lruvec, cache_ext_target, sc,
                                     &cache_ext_active);
@@ -7003,6 +7030,13 @@ static void shrink_lruvec(struct lruvec* lruvec, struct scan_control* sc)
     nr_to_reclaim = remaining_to_reclaim;
     nr_reclaimed += cache_ext_reclaimed;
 
+    /*
+     * Policy victims replace the inactive-file pages the kernel LRU would
+     * otherwise have scanned.  Leave only the shortfall for the fallback.
+     */
+    if (budget_mode == 1 || budget_mode == 2)
+      nr[LRU_INACTIVE_FILE] -= min(nr[LRU_INACTIVE_FILE], cache_ext_reclaimed);
+
     if (!proportional_reclaim && nr_reclaimed >= nr_to_reclaim)
     {
       pr_info_ratelimited("cache_ext reclaim OK: scan_budget=%lu target=%lu reclaimed=%lu => skip kernel scan\n",
@@ -7013,11 +7047,12 @@ static void shrink_lruvec(struct lruvec* lruvec, struct scan_control* sc)
       return;
     }
 
-    pr_info_ratelimited("cache_ext reclaim SHORT: scan_budget=%lu target=%lu reclaimed=%lu remaining=%lu => kernel fallback scan\n",
+    pr_info_ratelimited("cache_ext reclaim SHORT: scan_budget=%lu target=%lu reclaimed=%lu remaining=%lu native_inactive_budget=%lu budget_mode=%d => kernel fallback scan\n",
                         file_scan_budget, cache_ext_target,
                         cache_ext_reclaimed,
                         nr_to_reclaim - min(nr_reclaimed,
-                                            nr_to_reclaim));
+                                            nr_to_reclaim),
+                        nr[LRU_INACTIVE_FILE], budget_mode);
     atomic64_inc(&lruvec_memcg(lruvec)->
                  cache_ext_reclaim_stats[CACHE_EXT_RECLAIM_fallback_calls]);
     atomic64_add(file_scan_budget, &lruvec_memcg(lruvec)->
